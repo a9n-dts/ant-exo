@@ -220,25 +220,14 @@ class KernelBuilder:
         tmp5 = self.alloc_scratch("tmp5")
         tmp6 = self.alloc_scratch("tmp6")
 
-        # Load init vars from memory header
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-
-        # Scalar constants
+        # Scalar constants and derived layout pointers
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        forest_values_p_const = 7
+        inp_values_p_const = forest_values_p_const + n_nodes + batch_size
+        batch_size_const = self.scratch_const(batch_size)
+        forest_values_p = self.scratch_const(forest_values_p_const)
+        inp_values_p = self.scratch_const(inp_values_p_const)
 
         tmp7 = self.alloc_scratch("tmp7")
         tmp8 = self.alloc_scratch("tmp8")
@@ -321,12 +310,12 @@ class KernelBuilder:
 
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
-        self.add("valu", ("vbroadcast", v_fvp, self.scratch["forest_values_p"]))
-        self.add("load", ("load", root_node, self.scratch["forest_values_p"]))
+        self.add("valu", ("vbroadcast", v_fvp, forest_values_p))
+        self.add("load", ("load", root_node, forest_values_p))
         self.add("valu", ("vbroadcast", v_root, root_node))
-        self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], 1))
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 1))
         self.add("load", ("load", node_d1_l, node_addr))
-        self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], 2))
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 2))
         self.add("load", ("load", node_d1_r, node_addr))
         self.add("valu", ("vbroadcast", v_d1_l, node_d1_l))
         self.add("valu", ("vbroadcast", v_d1_r, node_d1_r))
@@ -524,23 +513,91 @@ class KernelBuilder:
             for i in range(0, len(ops), SLOT_LIMITS["valu"]):
                 emit_bundle(body, valu=ops[i : i + SLOT_LIMITS["valu"]])
 
-        def hash_cycles(groups, round_idx, need_next_addr):
+        def add_valu_node(nodes, op, deps=None, earliest=0):
+            nodes.append(
+                {
+                    "op": op,
+                    "deps": [] if deps is None else deps,
+                    "earliest": earliest,
+                    "order": len(nodes),
+                }
+            )
+            return len(nodes) - 1
+
+        def schedule_valu_nodes(nodes):
+            if not nodes:
+                return []
+
+            children = [[] for _ in nodes]
+            for nid, node in enumerate(nodes):
+                for dep in node["deps"]:
+                    children[dep].append(nid)
+
+            crit = [1] * len(nodes)
+            for nid in range(len(nodes) - 1, -1, -1):
+                if children[nid]:
+                    crit[nid] = 1 + max(crit[cid] for cid in children[nid])
+
+            pending = set(range(len(nodes)))
+            done_cycle = {}
             cycles = []
+            while pending:
+                cycle_idx = len(cycles)
+                ready = []
+                for nid in pending:
+                    node = nodes[nid]
+                    if node["earliest"] > cycle_idx:
+                        continue
+                    if all(
+                        dep in done_cycle and done_cycle[dep] < cycle_idx
+                        for dep in node["deps"]
+                    ):
+                        ready.append(nid)
+
+                if not ready:
+                    cycles.append([])
+                    continue
+
+                ready.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                chosen = ready[: SLOT_LIMITS["valu"]]
+                cycles.append([nodes[nid]["op"] for nid in chosen])
+                for nid in chosen:
+                    pending.remove(nid)
+                    done_cycle[nid] = cycle_idx
+
+            while cycles and not cycles[-1]:
+                cycles.pop()
+            return cycles
+
+        def append_hash_nodes(nodes, groups, round_idx, need_next_addr):
+            prev_val = [None] * len(groups)
+            prev_idx = [None] * len(groups)
+
             for stage in hash_stage_plan:
                 if stage[0] == "muladd":
                     _, v_mul, v_add = stage
-                    chunked(
-                        cycles,
-                        [("multiply_add", g["val"], g["val"], v_mul, v_add) for g in groups],
-                    )
+                    for gi, g in enumerate(groups):
+                        deps = [] if prev_val[gi] is None else [prev_val[gi]]
+                        prev_val[gi] = add_valu_node(
+                            nodes,
+                            ("multiply_add", g["val"], g["val"], v_mul, v_add),
+                            deps=deps,
+                        )
                 else:
                     _, op1, op2, op3, vc1, vc3 = stage
-                    chunked(
-                        cycles,
-                        [(op1, g["tmp1"], g["val"], vc1) for g in groups]
-                        + [(op3, g["tmp2"], g["val"], vc3) for g in groups],
-                    )
-                    chunked(cycles, [(op2, g["val"], g["tmp1"], g["tmp2"]) for g in groups])
+                    for gi, g in enumerate(groups):
+                        deps = [] if prev_val[gi] is None else [prev_val[gi]]
+                        n1 = add_valu_node(
+                            nodes, (op1, g["tmp1"], g["val"], vc1), deps=deps
+                        )
+                        n2 = add_valu_node(
+                            nodes, (op3, g["tmp2"], g["val"], vc3), deps=deps
+                        )
+                        prev_val[gi] = add_valu_node(
+                            nodes,
+                            (op2, g["val"], g["tmp1"], g["tmp2"]),
+                            deps=[n1, n2],
+                        )
 
             should_update_idx = (
                 round_idx < rounds - 1 and (round_idx + 1) % wrap_period != 0
@@ -548,36 +605,38 @@ class KernelBuilder:
             if should_update_idx:
                 if round_idx % wrap_period == 0:
                     # Root rounds always start with idx=0, so next idx is 1 + (val & 1).
-                    chunked(cycles, [("&", g["tmp1"], g["val"], v_one) for g in groups])
-                    chunked(cycles, [("+", g["idx"], g["tmp1"], v_one) for g in groups])
+                    for gi, g in enumerate(groups):
+                        deps = [] if prev_val[gi] is None else [prev_val[gi]]
+                        n1 = add_valu_node(
+                            nodes, ("&", g["tmp1"], g["val"], v_one), deps=deps
+                        )
+                        prev_idx[gi] = add_valu_node(
+                            nodes, ("+", g["idx"], g["tmp1"], v_one), deps=[n1]
+                        )
                 else:
-                    chunked(
-                        cycles,
-                        [("&", g["tmp1"], g["val"], v_one) for g in groups]
-                        + [
-                            ("multiply_add", g["idx"], g["idx"], v_two, v_one)
-                            for g in groups
-                        ],
-                    )
-                    chunked(cycles, [("+", g["idx"], g["idx"], g["tmp1"]) for g in groups])
+                    for gi, g in enumerate(groups):
+                        val_deps = [] if prev_val[gi] is None else [prev_val[gi]]
+                        idx_deps = [] if prev_idx[gi] is None else [prev_idx[gi]]
+                        n1 = add_valu_node(
+                            nodes, ("&", g["tmp1"], g["val"], v_one), deps=val_deps
+                        )
+                        n2 = add_valu_node(
+                            nodes,
+                            ("multiply_add", g["idx"], g["idx"], v_two, v_one),
+                            deps=idx_deps,
+                        )
+                        prev_idx[gi] = add_valu_node(
+                            nodes, ("+", g["idx"], g["idx"], g["tmp1"]), deps=[n1, n2]
+                        )
 
             if need_next_addr:
-                chunked(cycles, [("+", g["addr"], v_fvp, g["idx"]) for g in groups])
-            return cycles
+                for gi, g in enumerate(groups):
+                    deps = [] if prev_idx[gi] is None else [prev_idx[gi]]
+                    add_valu_node(nodes, ("+", g["addr"], v_fvp, g["idx"]), deps=deps)
 
-        def gather_plan(groups, gather_round_idx):
-            mode = gather_mode(gather_round_idx)
-            if mode == "root":
-                return [], [[("^", g["val"], g["val"], v_root) for g in groups]], 0
-            if mode == "d1":
-                return [], [
-                    [("&", g["tmp1"], g["idx"], v_one) for g in groups],
-                    [
-                        ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r)
-                        for g in groups
-                    ],
-                    [("^", g["val"], g["val"], g["node"]) for g in groups],
-                ], 0
+        def gather_load_cycles(groups, gather_round_idx):
+            if gather_mode(gather_round_idx) != "gather":
+                return []
             load_cycles = []
             load_ops = []
             for offset in range(VLEN):
@@ -585,55 +644,259 @@ class KernelBuilder:
                     load_ops.append(("load_offset", g["node"], g["addr"], offset))
             for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
                 load_cycles.append(load_ops[i : i + SLOT_LIMITS["load"]])
+            return load_cycles
+
+        def append_gather_nodes(nodes, groups, gather_round_idx, load_ready_cycle):
+            mode = gather_mode(gather_round_idx)
+            if mode == "root":
+                for g in groups:
+                    add_valu_node(nodes, ("^", g["val"], g["val"], v_root))
+                return
+            if mode == "d1":
+                for g in groups:
+                    n1 = add_valu_node(nodes, ("&", g["tmp1"], g["idx"], v_one))
+                    n2 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r),
+                        deps=[n1],
+                    )
+                    add_valu_node(nodes, ("^", g["val"], g["val"], g["node"]), deps=[n2])
+                return
+
             # XOR depends on all gathers, so earliest start is next cycle after load cycles.
-            return load_cycles, [[("^", g["val"], g["val"], g["node"]) for g in groups]], len(load_cycles)
+            for g in groups:
+                add_valu_node(
+                    nodes,
+                    ("^", g["val"], g["val"], g["node"]),
+                    earliest=load_ready_cycle,
+                )
 
         def emit_gather_only(body, groups, gather_round_idx):
-            load_cycles, gather_valu_cycles, gather_start = gather_plan(groups, gather_round_idx)
-            bundles = [{"load": lc, "valu": []} for lc in load_cycles]
-            pos = gather_start
-            for ops in gather_valu_cycles:
-                while len(bundles) <= pos:
-                    bundles.append({"load": [], "valu": []})
-                bundles[pos]["valu"].extend(ops)
-                pos += 1
-            for b in bundles:
-                emit_bundle(body, valu=b["valu"], load=b["load"])
+            load_cycles = gather_load_cycles(groups, gather_round_idx)
+            nodes = []
+            append_gather_nodes(nodes, groups, gather_round_idx, len(load_cycles))
+            valu_cycles = schedule_valu_nodes(nodes)
+            phase_len = max(len(load_cycles), len(valu_cycles))
+            for ci in range(phase_len):
+                loads = load_cycles[ci] if ci < len(load_cycles) else None
+                vals = valu_cycles[ci] if ci < len(valu_cycles) else None
+                emit_bundle(body, valu=vals, load=loads)
 
         def emit_overlap_phase(
             body, gather_groups, hash_groups, round_idx, need_next_addr, gather_round_idx
         ):
-            hcycles = hash_cycles(hash_groups, round_idx, need_next_addr)
-            load_cycles, gather_valu_cycles, gather_start = gather_plan(
-                gather_groups, gather_round_idx
-            )
-            phase_len = max(len(hcycles), len(load_cycles))
-            bundles = [{"valu": [], "load": []} for _ in range(phase_len)]
+            load_cycles = gather_load_cycles(gather_groups, gather_round_idx)
+            nodes = []
+            append_hash_nodes(nodes, hash_groups, round_idx, need_next_addr)
+            append_gather_nodes(nodes, gather_groups, gather_round_idx, len(load_cycles))
+            valu_cycles = schedule_valu_nodes(nodes)
 
-            for ci, ops in enumerate(hcycles):
-                bundles[ci]["valu"].extend(ops)
-            for ci, loads in enumerate(load_cycles):
-                while len(bundles) <= ci:
-                    bundles.append({"valu": [], "load": []})
-                bundles[ci]["load"].extend(loads)
-
-            pos = gather_start
-            for ops in gather_valu_cycles:
-                while True:
-                    while len(bundles) <= pos:
-                        bundles.append({"valu": [], "load": []})
-                    if len(bundles[pos]["valu"]) + len(ops) <= SLOT_LIMITS["valu"]:
-                        bundles[pos]["valu"].extend(ops)
-                        pos += 1
-                        break
-                    pos += 1
-
-            for b in bundles:
-                emit_bundle(body, valu=b["valu"], load=b["load"])
+            phase_len = max(len(load_cycles), len(valu_cycles))
+            for ci in range(phase_len):
+                loads = load_cycles[ci] if ci < len(load_cycles) else None
+                vals = valu_cycles[ci] if ci < len(valu_cycles) else None
+                emit_bundle(body, valu=vals, load=loads)
 
         def emit_hash_only(body, groups, round_idx, need_next_addr):
-            for ops in hash_cycles(groups, round_idx, need_next_addr):
+            nodes = []
+            append_hash_nodes(nodes, groups, round_idx, need_next_addr)
+            for ops in schedule_valu_nodes(nodes):
                 emit_bundle(body, valu=ops)
+
+        def add_sched_node(nodes, engine, op, deps=None):
+            nodes.append(
+                {
+                    "engine": engine,
+                    "op": op,
+                    "deps": [] if deps is None else deps,
+                    "order": len(nodes),
+                }
+            )
+            return len(nodes) - 1
+
+        def schedule_mixed_nodes(nodes):
+            if not nodes:
+                return []
+
+            children = [[] for _ in nodes]
+            for nid, node in enumerate(nodes):
+                for dep in node["deps"]:
+                    children[dep].append(nid)
+
+            crit = [1] * len(nodes)
+            for nid in range(len(nodes) - 1, -1, -1):
+                if children[nid]:
+                    crit[nid] = 1 + max(crit[cid] for cid in children[nid])
+
+            pending = set(range(len(nodes)))
+            done_cycle = {}
+            bundles = []
+
+            while pending:
+                cycle_idx = len(bundles)
+                ready_valu = []
+                ready_load = []
+                for nid in pending:
+                    node = nodes[nid]
+                    if all(
+                        dep in done_cycle and done_cycle[dep] < cycle_idx
+                        for dep in node["deps"]
+                    ):
+                        if node["engine"] == "valu":
+                            ready_valu.append(nid)
+                        else:
+                            ready_load.append(nid)
+
+                ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                ready_load.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                chosen_valu = ready_valu[: SLOT_LIMITS["valu"]]
+                chosen_load = ready_load[: SLOT_LIMITS["load"]]
+
+                if not chosen_valu and not chosen_load:
+                    # Should not happen with this DAG construction.
+                    raise RuntimeError("No schedulable ops in mixed scheduler")
+
+                bundles.append(
+                    {
+                        "valu": [nodes[nid]["op"] for nid in chosen_valu],
+                        "load": [nodes[nid]["op"] for nid in chosen_load],
+                    }
+                )
+                for nid in chosen_valu + chosen_load:
+                    pending.remove(nid)
+                    done_cycle[nid] = cycle_idx
+            return bundles
+
+        def build_octet_schedule(groups):
+            nodes = []
+            val_ready = [None] * len(groups)
+            idx_ready = [None] * len(groups)
+
+            def deps_of(*deps):
+                return [dep for dep in deps if dep is not None]
+
+            for round_idx in range(rounds):
+                mode = gather_mode(round_idx)
+                for gi, g in enumerate(groups):
+                    if mode == "root":
+                        val_ready[gi] = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("^", g["val"], g["val"], v_root),
+                            deps=deps_of(val_ready[gi]),
+                        )
+                    elif mode == "d1":
+                        n1 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("&", g["tmp1"], g["idx"], v_one),
+                            deps=deps_of(idx_ready[gi]),
+                        )
+                        n2 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r),
+                            deps=[n1],
+                        )
+                        val_ready[gi] = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("^", g["val"], g["val"], g["node"]),
+                            deps=deps_of(val_ready[gi], n2),
+                        )
+                    else:
+                        n_addr = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("+", g["addr"], v_fvp, g["idx"]),
+                            deps=deps_of(idx_ready[gi]),
+                        )
+                        load_nodes = []
+                        for offset in range(VLEN):
+                            load_nodes.append(
+                                add_sched_node(
+                                    nodes,
+                                    "load",
+                                    ("load_offset", g["node"], g["addr"], offset),
+                                    deps=[n_addr],
+                                )
+                            )
+                        val_ready[gi] = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("^", g["val"], g["val"], g["node"]),
+                            deps=deps_of(val_ready[gi], *load_nodes),
+                        )
+
+                    for stage in hash_stage_plan:
+                        if stage[0] == "muladd":
+                            _, v_mul, v_add = stage
+                            val_ready[gi] = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("multiply_add", g["val"], g["val"], v_mul, v_add),
+                                deps=deps_of(val_ready[gi]),
+                            )
+                        else:
+                            _, op1, op2, op3, vc1, vc3 = stage
+                            n1 = add_sched_node(
+                                nodes,
+                                "valu",
+                                (op1, g["tmp1"], g["val"], vc1),
+                                deps=deps_of(val_ready[gi]),
+                            )
+                            n2 = add_sched_node(
+                                nodes,
+                                "valu",
+                                (op3, g["tmp2"], g["val"], vc3),
+                                deps=deps_of(val_ready[gi]),
+                            )
+                            val_ready[gi] = add_sched_node(
+                                nodes,
+                                "valu",
+                                (op2, g["val"], g["tmp1"], g["tmp2"]),
+                                deps=[n1, n2],
+                            )
+
+                    should_update_idx = (
+                        round_idx < rounds - 1 and (round_idx + 1) % wrap_period != 0
+                    )
+                    if should_update_idx:
+                        if round_idx % wrap_period == 0:
+                            # Root rounds always start with idx=0.
+                            n1 = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("&", g["tmp1"], g["val"], v_one),
+                                deps=deps_of(val_ready[gi]),
+                            )
+                            idx_ready[gi] = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("+", g["idx"], g["tmp1"], v_one),
+                                deps=[n1],
+                            )
+                        else:
+                            n1 = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("&", g["tmp1"], g["val"], v_one),
+                                deps=deps_of(val_ready[gi]),
+                            )
+                            n2 = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("multiply_add", g["idx"], g["idx"], v_two, v_one),
+                                deps=deps_of(idx_ready[gi]),
+                            )
+                            idx_ready[gi] = add_sched_node(
+                                nodes,
+                                "valu",
+                                ("+", g["idx"], g["idx"], g["tmp1"]),
+                                deps=[n1, n2],
+                            )
+
+            return schedule_mixed_nodes(nodes)
 
         def emit_tail_groups(group_count, g_off_words):
             groups = groups_all[:group_count]
@@ -641,7 +904,7 @@ class KernelBuilder:
             tail_body = []
 
             tail_body.append(
-                ("alu", ("+", val_ptrs[0], self.scratch["inp_values_p"], g_off_const))
+                ("alu", ("+", val_ptrs[0], inp_values_p, g_off_const))
             )
             for gi in range(1, group_count):
                 tail_body.append(
@@ -669,14 +932,14 @@ class KernelBuilder:
 
             self.instrs.extend(self.build(tail_body))
 
-        # Software-pipelined octet loop: overlap gather(load) of one half
-        # with hash/index(valu) of the other half.
+        # Octet loop scheduled from a single dependency graph across all
+        # 8 groups so load-heavy gathers and hash chains can interleave freely.
         octet_groups = (n_groups // 8) * 8
         if octet_groups > 0:
             self.add("load", ("const", loop_g_off, 0))
             octet_batch = octet_groups * VLEN
             loop_bound = (
-                self.scratch["batch_size"]
+                batch_size_const
                 if octet_batch == batch_size
                 else self.scratch_const(octet_batch)
             )
@@ -686,7 +949,7 @@ class KernelBuilder:
             emit_bundle(
                 octet_body,
                 alu=[
-                    ("+", val_ptrs[0], self.scratch["inp_values_p"], loop_g_off),
+                    ("+", val_ptrs[0], inp_values_p, loop_g_off),
                 ],
             )
             for gi in range(1, 8):
@@ -703,62 +966,29 @@ class KernelBuilder:
                 [("^", g["idx"], g["idx"], g["idx"]) for g in groups_all],
             )
 
-            for gi, g in enumerate(groups_all):
+            for gi in range(0, 8, 2):
                 emit_bundle(
                     octet_body,
                     load=[
-                        ("vload", g["val"], val_ptrs[gi]),
+                        ("vload", groups_all[gi]["val"], val_ptrs[gi]),
+                        ("vload", groups_all[gi + 1]["val"], val_ptrs[gi + 1]),
                     ],
                 )
 
-            # Initial round-0 addresses for both triplets.
-            emit_valu_chunked(
-                octet_body,
-                [("+", g["addr"], v_fvp, g["idx"]) for g in groups_all],
-            )
+            for bundle in build_octet_schedule(groups_all):
+                emit_bundle(octet_body, valu=bundle["valu"], load=bundle["load"])
 
-            # Prologue: gather first half round 0 so hash(A,0) can start.
-            emit_gather_only(octet_body, half_a, 0)
-
-            for round_idx in range(rounds):
-                need_next_addr = (
-                    round_idx < rounds - 1 and gather_mode(round_idx + 1) == "gather"
-                )
-                emit_overlap_phase(
-                    octet_body,
-                    gather_groups=half_b,
-                    hash_groups=half_a,
-                    round_idx=round_idx,
-                    need_next_addr=need_next_addr,
-                    gather_round_idx=round_idx,
-                )
-                if round_idx < rounds - 1:
-                    emit_overlap_phase(
-                        octet_body,
-                        gather_groups=half_a,
-                        hash_groups=half_b,
-                        round_idx=round_idx,
-                        need_next_addr=need_next_addr,
-                        gather_round_idx=round_idx + 1,
-                    )
-                else:
-                    emit_hash_only(
-                        octet_body,
-                        groups=half_b,
-                        round_idx=round_idx,
-                        need_next_addr=False,
-                    )
-
-            for gi, g in enumerate(groups_all):
+            for gi in range(0, 8, 2):
                 flow_ops = (
                     [("add_imm", loop_g_off, loop_g_off, eight_vlen)]
-                    if gi == 7
+                    if gi == 6
                     else None
                 )
                 emit_bundle(
                     octet_body,
                     store=[
-                        ("vstore", val_ptrs[gi], g["val"]),
+                        ("vstore", val_ptrs[gi], groups_all[gi]["val"]),
+                        ("vstore", val_ptrs[gi + 1], groups_all[gi + 1]["val"]),
                     ],
                     flow=flow_ops,
                 )

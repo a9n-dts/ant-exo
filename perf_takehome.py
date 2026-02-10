@@ -304,58 +304,36 @@ class KernelBuilder:
             pair_body.append(("load", ("vload", v_idx_b, tmp3)))
             pair_body.append(("load", ("vload", v_val_b, tmp4)))
 
-            # Prologue: gather group A for round 0.
-            pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
-            for offset in range(VLEN):
-                pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
-
-            for round_i in range(rounds):
-                # Gather B(round_i) while hashing A(round_i).
+            for _ in range(rounds):
+                # In-phase gather: both groups gather in the same round.
+                pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
                 pair_body.append(("valu", ("+", v_addr_b, v_fvp, v_idx_b)))
-                pair_body.append(("valu", ("^", v_val_a, v_val_a, v_node_val_a)))
+                for offset in range(VLEN):
+                    pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
+                    pair_body.append(("load", ("load_offset", v_node_val_b, v_addr_b, offset)))
 
-                b_load_offset = 0
+                pair_body.append(("valu", ("^", v_val_a, v_val_a, v_node_val_a)))
+                pair_body.append(("valu", ("^", v_val_b, v_val_b, v_node_val_b)))
+
+                # In-phase hash packing across A and B.
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     vc1, vc3 = v_hash_consts[hi]
                     pair_body.append(("valu", (op1, v_tmp1_a, v_val_a, vc1)))
                     pair_body.append(("valu", (op3, v_tmp2_a, v_val_a, vc3)))
-                    if b_load_offset < VLEN:
-                        pair_body.append(("load", ("load_offset", v_node_val_b, v_addr_b, b_load_offset)))
-                        b_load_offset += 1
-                    if b_load_offset < VLEN:
-                        pair_body.append(("load", ("load_offset", v_node_val_b, v_addr_b, b_load_offset)))
-                        b_load_offset += 1
-                    pair_body.append(("valu", (op2, v_val_a, v_tmp1_a, v_tmp2_a)))
-
-                pair_body.append(("valu", ("&", v_tmp1_a, v_val_a, v_one)))
-                pair_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
-                pair_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
-                pair_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
-                pair_body.append(("valu", ("*", v_idx_a, v_idx_a, v_tmp1_a)))
-
-                # If there is another round, gather A(round_i+1) while hashing B(round_i).
-                has_next_round = round_i + 1 < rounds
-                if has_next_round:
-                    pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
-
-                pair_body.append(("valu", ("^", v_val_b, v_val_b, v_node_val_b)))
-                a_load_offset = 0
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    vc1, vc3 = v_hash_consts[hi]
                     pair_body.append(("valu", (op1, v_tmp1_b, v_val_b, vc1)))
                     pair_body.append(("valu", (op3, v_tmp2_b, v_val_b, vc3)))
-                    if has_next_round and a_load_offset < VLEN:
-                        pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, a_load_offset)))
-                        a_load_offset += 1
-                    if has_next_round and a_load_offset < VLEN:
-                        pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, a_load_offset)))
-                        a_load_offset += 1
+                    pair_body.append(("valu", (op2, v_val_a, v_tmp1_a, v_tmp2_a)))
                     pair_body.append(("valu", (op2, v_val_b, v_tmp1_b, v_tmp2_b)))
 
+                pair_body.append(("valu", ("&", v_tmp1_a, v_val_a, v_one)))
                 pair_body.append(("valu", ("&", v_tmp1_b, v_val_b, v_one)))
+                pair_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
                 pair_body.append(("valu", ("multiply_add", v_idx_b, v_idx_b, v_two, v_one)))
+                pair_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
                 pair_body.append(("valu", ("+", v_idx_b, v_idx_b, v_tmp1_b)))
+                pair_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
                 pair_body.append(("valu", ("<", v_tmp1_b, v_idx_b, v_n_nodes)))
+                pair_body.append(("valu", ("*", v_idx_a, v_idx_a, v_tmp1_a)))
                 pair_body.append(("valu", ("*", v_idx_b, v_idx_b, v_tmp1_b)))
 
             pair_body.append(("store", ("vstore", tmp1, v_idx_a)))

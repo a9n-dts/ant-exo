@@ -363,7 +363,7 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_d2_offset, three_const))
 
         # Depth-3 pre-computation: load tree[7..14] and derive pairwise deltas.
-        d3_specialize = forest_height >= 3 and os.environ.get("PK_D3_SPECIALIZE", "0") != "0"
+        d3_specialize = forest_height >= 3 and os.environ.get("PK_D3_SPECIALIZE", "1") != "0"
         v_d3_offset = None
         v_d3_b8 = v_d3_b10 = v_d3_b12 = v_d3_b14 = None
         v_d3_d70 = v_d3_d910 = v_d3_d1112 = v_d3_d1314 = None
@@ -996,7 +996,7 @@ class KernelBuilder:
                 for nid, node in enumerate(nodes)
                 if node["engine"] == "valu" and node.get("decomposable")
             ]
-            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "0.9885"))
+            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "0.984"))
             dec_limit_env = os.environ.get("PK_DEC_LIMIT")
             if dec_limit_env is not None:
                 n_decompose = int(dec_limit_env)
@@ -1319,112 +1319,96 @@ class KernelBuilder:
                             ("-", g["tmp1"], g["idx"], v_d3_offset),
                             deps=deps_of(idx_ready[gi]),
                             earliest=start_earliest,
-                            decomposable=False,
                         )
                         n2 = add_sched_node(
                             nodes,
                             "valu",
                             ("&", g["tmp2"], g["tmp1"], v_one),
                             deps=[n1],
-                            decomposable=False,
                         )
                         n3 = add_sched_node(
                             nodes,
                             "valu",
                             (">>", g["tmp3"], g["tmp1"], v_one),
                             deps=[n1],
-                            decomposable=False,
                         )
                         n4 = add_sched_node(
                             nodes,
                             "valu",
                             ("&", g["addr"], g["tmp3"], v_one),
                             deps=[n3],
-                            decomposable=False,
                         )
                         n5 = add_sched_node(
                             nodes,
                             "valu",
                             (">>", g["tmp1"], g["tmp3"], v_one),
                             deps=[n3],
-                            decomposable=False,
                         )
                         n6 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["node"], g["tmp2"], v_d3_d70, v_d3_b8),
                             deps=[n2],
-                            decomposable=False,
                         )
                         n7 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d910, v_d3_b10),
                             deps=[n2],
-                            decomposable=False,
                         )
                         n8 = add_sched_node(
                             nodes,
                             "valu",
                             ("-", g["tmp3"], g["tmp3"], g["node"]),
                             deps=[n6, n7],
-                            decomposable=False,
                         )
                         n9 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["node"], g["addr"], g["tmp3"], g["node"]),
                             deps=[n4, n8],
-                            decomposable=False,
                         )
                         n10 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d1112, v_d3_b12),
                             deps=[n2],
-                            decomposable=False,
                         )
                         n11 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["tmp2"], g["tmp2"], v_d3_d1314, v_d3_b14),
                             deps=[n2],
-                            decomposable=False,
                         )
                         n12 = add_sched_node(
                             nodes,
                             "valu",
                             ("-", g["tmp2"], g["tmp2"], g["tmp3"]),
                             deps=[n10, n11],
-                            decomposable=False,
                         )
                         n13 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["tmp3"], g["addr"], g["tmp2"], g["tmp3"]),
                             deps=[n4, n12],
-                            decomposable=False,
                         )
                         n14 = add_sched_node(
                             nodes,
                             "valu",
                             ("-", g["tmp3"], g["tmp3"], g["node"]),
                             deps=[n9, n13],
-                            decomposable=False,
                         )
                         n15 = add_sched_node(
                             nodes,
                             "valu",
                             ("multiply_add", g["node"], g["tmp1"], g["tmp3"], g["node"]),
                             deps=[n5, n14],
-                            decomposable=False,
                         )
                         val_ready[gi] = add_sched_node(
                             nodes,
                             "valu",
                             ("^", g["val"], g["val"], g["node"]),
                             deps=deps_of(val_ready[gi], n15),
-                            decomposable=False,
                         )
                     else:
                         n_addr = add_sched_node(

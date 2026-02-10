@@ -996,7 +996,7 @@ class KernelBuilder:
                 for nid, node in enumerate(nodes)
                 if node["engine"] == "valu" and node.get("decomposable")
             ]
-            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "1.0"))
+            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "0.988"))
             dec_limit_env = os.environ.get("PK_DEC_LIMIT")
             if dec_limit_env is not None:
                 n_decompose = int(dec_limit_env)
@@ -1074,20 +1074,20 @@ class KernelBuilder:
                 chosen_alu_frags = []
                 chosen_alu_nodes = set()
 
-                # Fill spare VALU slots with decomposable ops that have NOT yet
-                # started ALU decomposition.  This shifts throughput from the
-                # saturated ALU engine to the underused VALU engine.
+                # Claim spare VALU slots for decomposable ops BEFORE ALU,
+                # shifting work from the throughput-saturated ALU engine.
+                # Only claim ops that haven't started ALU decomposition.
                 n_frags_full = VLEN // alu_frag
-                valu_slots_left = SLOT_LIMITS["valu"] - len(chosen_valu)
+                valu_prefill = int(os.environ.get("PK_VALU_PREFILL", "6"))
                 chosen_valu_dec = set()
-                if valu_slots_left > 0:
+                valu_cap = min(len(chosen_valu) + valu_prefill, SLOT_LIMITS["valu"])
+                if len(chosen_valu) < valu_cap:
                     for nid in ready_valu_dec:
                         frags = alu_lane_frags.get(nid)
                         if frags is not None and len(frags) == n_frags_full:
-                            # Not yet started on ALU — safe to claim for VALU
                             chosen_valu.append(nid)
                             chosen_valu_dec.add(nid)
-                            if len(chosen_valu) >= SLOT_LIMITS["valu"]:
+                            if len(chosen_valu) >= valu_cap:
                                 break
 
                 alu_slots_left = SLOT_LIMITS["alu"]

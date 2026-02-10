@@ -247,6 +247,7 @@ class KernelBuilder:
         v_node_val_a = self.alloc_scratch("v_node_val_a", VLEN)
         v_tmp1_a = self.alloc_scratch("v_tmp1_a", VLEN)
         v_tmp2_a = self.alloc_scratch("v_tmp2_a", VLEN)
+        v_tmp3_a = self.alloc_scratch("v_tmp3_a", VLEN)
         v_addr_a = self.alloc_scratch("v_addr_a", VLEN)
 
         v_idx_b = self.alloc_scratch("v_idx_b", VLEN)
@@ -254,6 +255,7 @@ class KernelBuilder:
         v_node_val_b = self.alloc_scratch("v_node_val_b", VLEN)
         v_tmp1_b = self.alloc_scratch("v_tmp1_b", VLEN)
         v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
+        v_tmp3_b = self.alloc_scratch("v_tmp3_b", VLEN)
         v_addr_b = self.alloc_scratch("v_addr_b", VLEN)
 
         v_idx_c = self.alloc_scratch("v_idx_c", VLEN)
@@ -261,6 +263,7 @@ class KernelBuilder:
         v_node_val_c = self.alloc_scratch("v_node_val_c", VLEN)
         v_tmp1_c = self.alloc_scratch("v_tmp1_c", VLEN)
         v_tmp2_c = self.alloc_scratch("v_tmp2_c", VLEN)
+        v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
         v_addr_c = self.alloc_scratch("v_addr_c", VLEN)
 
         v_idx_d = self.alloc_scratch("v_idx_d", VLEN)
@@ -268,6 +271,7 @@ class KernelBuilder:
         v_node_val_d = self.alloc_scratch("v_node_val_d", VLEN)
         v_tmp1_d = self.alloc_scratch("v_tmp1_d", VLEN)
         v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
+        v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
         v_addr_d = self.alloc_scratch("v_addr_d", VLEN)
 
         v_idx_e = self.alloc_scratch("v_idx_e", VLEN)
@@ -275,6 +279,7 @@ class KernelBuilder:
         v_node_val_e = self.alloc_scratch("v_node_val_e", VLEN)
         v_tmp1_e = self.alloc_scratch("v_tmp1_e", VLEN)
         v_tmp2_e = self.alloc_scratch("v_tmp2_e", VLEN)
+        v_tmp3_e = self.alloc_scratch("v_tmp3_e", VLEN)
         v_addr_e = self.alloc_scratch("v_addr_e", VLEN)
 
         v_idx_f = self.alloc_scratch("v_idx_f", VLEN)
@@ -282,6 +287,7 @@ class KernelBuilder:
         v_node_val_f = self.alloc_scratch("v_node_val_f", VLEN)
         v_tmp1_f = self.alloc_scratch("v_tmp1_f", VLEN)
         v_tmp2_f = self.alloc_scratch("v_tmp2_f", VLEN)
+        v_tmp3_f = self.alloc_scratch("v_tmp3_f", VLEN)
         v_addr_f = self.alloc_scratch("v_addr_f", VLEN)
 
         v_idx_g = self.alloc_scratch("v_idx_g", VLEN)
@@ -289,6 +295,7 @@ class KernelBuilder:
         v_node_val_g = self.alloc_scratch("v_node_val_g", VLEN)
         v_tmp1_g = self.alloc_scratch("v_tmp1_g", VLEN)
         v_tmp2_g = self.alloc_scratch("v_tmp2_g", VLEN)
+        v_tmp3_g = self.alloc_scratch("v_tmp3_g", VLEN)
         v_addr_g = self.alloc_scratch("v_addr_g", VLEN)
 
         v_idx_h = self.alloc_scratch("v_idx_h", VLEN)
@@ -296,6 +303,7 @@ class KernelBuilder:
         v_node_val_h = self.alloc_scratch("v_node_val_h", VLEN)
         v_tmp1_h = self.alloc_scratch("v_tmp1_h", VLEN)
         v_tmp2_h = self.alloc_scratch("v_tmp2_h", VLEN)
+        v_tmp3_h = self.alloc_scratch("v_tmp3_h", VLEN)
         v_addr_h = self.alloc_scratch("v_addr_h", VLEN)
 
         # Vector constants (broadcast from scalars)
@@ -354,6 +362,48 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_d2_delta_hi, delta_hi_s))
         self.add("valu", ("vbroadcast", v_d2_offset, three_const))
 
+        # Depth-3 pre-computation: load tree[7..14] and derive pairwise deltas.
+        d3_specialize = forest_height >= 3 and os.environ.get("PK_D3_SPECIALIZE", "0") != "0"
+        v_d3_offset = None
+        v_d3_b8 = v_d3_b10 = v_d3_b12 = v_d3_b14 = None
+        v_d3_d70 = v_d3_d910 = v_d3_d1112 = v_d3_d1314 = None
+        if d3_specialize:
+            d3_nodes = [self.alloc_scratch(f"node_d3_{i}") for i in range(7, 15)]
+            for i, node_s in enumerate(d3_nodes, start=7):
+                self.add("flow", ("add_imm", node_addr, forest_values_p, i))
+                self.add("load", ("load", node_s, node_addr))
+
+            d3_delta_0 = self.alloc_scratch("d3_delta_0")
+            d3_delta_1 = self.alloc_scratch("d3_delta_1")
+            d3_delta_2 = self.alloc_scratch("d3_delta_2")
+            d3_delta_3 = self.alloc_scratch("d3_delta_3")
+            self.add("alu", ("-", d3_delta_0, d3_nodes[1], d3_nodes[0]))  # 8 - 7
+            self.add("alu", ("-", d3_delta_1, d3_nodes[3], d3_nodes[2]))  # 10 - 9
+            self.add("alu", ("-", d3_delta_2, d3_nodes[5], d3_nodes[4]))  # 12 - 11
+            self.add("alu", ("-", d3_delta_3, d3_nodes[7], d3_nodes[6]))  # 14 - 13
+
+            v_d3_offset = self.alloc_scratch("v_d3_offset", VLEN)
+            seven_const = self.scratch_const(7)
+            self.add("valu", ("vbroadcast", v_d3_offset, seven_const))
+
+            v_d3_b8 = self.alloc_scratch("v_d3_b8", VLEN)
+            v_d3_b10 = self.alloc_scratch("v_d3_b10", VLEN)
+            v_d3_b12 = self.alloc_scratch("v_d3_b12", VLEN)
+            v_d3_b14 = self.alloc_scratch("v_d3_b14", VLEN)
+            self.add("valu", ("vbroadcast", v_d3_b8, d3_nodes[0]))   # tree[7]
+            self.add("valu", ("vbroadcast", v_d3_b10, d3_nodes[2]))  # tree[9]
+            self.add("valu", ("vbroadcast", v_d3_b12, d3_nodes[4]))  # tree[11]
+            self.add("valu", ("vbroadcast", v_d3_b14, d3_nodes[6]))  # tree[13]
+
+            v_d3_d70 = self.alloc_scratch("v_d3_d70", VLEN)
+            v_d3_d910 = self.alloc_scratch("v_d3_d910", VLEN)
+            v_d3_d1112 = self.alloc_scratch("v_d3_d1112", VLEN)
+            v_d3_d1314 = self.alloc_scratch("v_d3_d1314", VLEN)
+            self.add("valu", ("vbroadcast", v_d3_d70, d3_delta_0))
+            self.add("valu", ("vbroadcast", v_d3_d910, d3_delta_1))
+            self.add("valu", ("vbroadcast", v_d3_d1112, d3_delta_2))
+            self.add("valu", ("vbroadcast", v_d3_d1314, d3_delta_3))
+
         # Broadcast hash stage constants to vectors and precompute simplified stages.
         # For stages of the form (a + c1) + (a << k), use multiply_add:
         # a = a * (2^k + 1) + c1
@@ -379,14 +429,17 @@ class KernelBuilder:
         # Loop variables
         loop_g_off = self.alloc_scratch("loop_g_off")
         cond = self.alloc_scratch("cond")
-        vlen_const = self.scratch_const(VLEN)
         two_vlen = 2 * VLEN
         three_vlen = 3 * VLEN
-        eight_vlen = 8 * VLEN
 
         val_ptrs = [tmp2, tmp4, tmp6, tmp8, tmp10, tmp12, tmp13, tmp14]
         for i in range(max_pipeline_groups - 8):
             val_ptrs.append(self.alloc_scratch(f"val_ptr_{i}"))
+        # Per-group word offsets (0, VLEN, 2*VLEN, ...) used to derive pointers
+        # from a single base each loop iteration with wide ALU bundles.
+        val_ptr_offset_consts = [0]
+        for gi in range(1, max_pipeline_groups):
+            val_ptr_offset_consts.append(self.scratch_const(gi * VLEN))
 
         groups_all = [
             {
@@ -395,6 +448,7 @@ class KernelBuilder:
                 "node": v_node_val_a,
                 "tmp1": v_tmp1_a,
                 "tmp2": v_tmp2_a,
+                "tmp3": v_tmp3_a,
                 "addr": v_addr_a,
             },
             {
@@ -403,6 +457,7 @@ class KernelBuilder:
                 "node": v_node_val_b,
                 "tmp1": v_tmp1_b,
                 "tmp2": v_tmp2_b,
+                "tmp3": v_tmp3_b,
                 "addr": v_addr_b,
             },
             {
@@ -411,6 +466,7 @@ class KernelBuilder:
                 "node": v_node_val_c,
                 "tmp1": v_tmp1_c,
                 "tmp2": v_tmp2_c,
+                "tmp3": v_tmp3_c,
                 "addr": v_addr_c,
             },
             {
@@ -419,6 +475,7 @@ class KernelBuilder:
                 "node": v_node_val_d,
                 "tmp1": v_tmp1_d,
                 "tmp2": v_tmp2_d,
+                "tmp3": v_tmp3_d,
                 "addr": v_addr_d,
             },
             {
@@ -427,6 +484,7 @@ class KernelBuilder:
                 "node": v_node_val_e,
                 "tmp1": v_tmp1_e,
                 "tmp2": v_tmp2_e,
+                "tmp3": v_tmp3_e,
                 "addr": v_addr_e,
             },
             {
@@ -435,6 +493,7 @@ class KernelBuilder:
                 "node": v_node_val_f,
                 "tmp1": v_tmp1_f,
                 "tmp2": v_tmp2_f,
+                "tmp3": v_tmp3_f,
                 "addr": v_addr_f,
             },
             {
@@ -443,6 +502,7 @@ class KernelBuilder:
                 "node": v_node_val_g,
                 "tmp1": v_tmp1_g,
                 "tmp2": v_tmp2_g,
+                "tmp3": v_tmp3_g,
                 "addr": v_addr_g,
             },
             {
@@ -451,6 +511,7 @@ class KernelBuilder:
                 "node": v_node_val_h,
                 "tmp1": v_tmp1_h,
                 "tmp2": v_tmp2_h,
+                "tmp3": v_tmp3_h,
                 "addr": v_addr_h,
             },
         ]
@@ -462,6 +523,7 @@ class KernelBuilder:
                     "node": self.alloc_scratch(f"v_node_val_{i}", VLEN),
                     "tmp1": self.alloc_scratch(f"v_tmp1_{i}", VLEN),
                     "tmp2": self.alloc_scratch(f"v_tmp2_{i}", VLEN),
+                    "tmp3": self.alloc_scratch(f"v_tmp3_{i}", VLEN),
                     "addr": self.alloc_scratch(f"v_addr_{i}", VLEN),
                 }
             )
@@ -486,6 +548,8 @@ class KernelBuilder:
                 return "d1"
             if depth == 2:
                 return "d2"
+            if d3_specialize and depth == 3:
+                return "d3"
             return "gather"
 
         def gather_slots_inphase(groups, round_idx):
@@ -520,6 +584,43 @@ class KernelBuilder:
                     body.append(("valu", ("-", g["tmp2"], g["tmp1"], g["node"])))
                 for g in groups:
                     body.append(("valu", ("multiply_add", g["node"], g["addr"], g["tmp2"], g["node"])))
+                for g in groups:
+                    body.append(("valu", ("^", g["val"], g["val"], g["node"])))
+                return body
+            if mode == "d3":
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp1"], g["idx"], v_d3_offset)))
+                for g in groups:
+                    body.append(("valu", ("&", g["tmp2"], g["tmp1"], v_one)))  # b0
+                for g in groups:
+                    body.append(("valu", (">>", g["tmp3"], g["tmp1"], v_one)))
+                for g in groups:
+                    body.append(("valu", ("&", g["addr"], g["tmp3"], v_one)))  # b1
+                for g in groups:
+                    body.append(("valu", (">>", g["tmp1"], g["tmp3"], v_one)))  # b2
+
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["node"], g["tmp2"], v_d3_d70, v_d3_b8)))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d910, v_d3_b10)))
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp3"], g["tmp3"], g["node"])))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["node"], g["addr"], g["tmp3"], g["node"])))
+
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d1112, v_d3_b12)))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["tmp2"], g["tmp2"], v_d3_d1314, v_d3_b14)))
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp2"], g["tmp2"], g["tmp3"])))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["tmp3"], g["addr"], g["tmp2"], g["tmp3"])))
+
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp3"], g["tmp3"], g["node"])))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["node"], g["tmp1"], g["tmp3"], g["node"])))
                 for g in groups:
                     body.append(("valu", ("^", g["val"], g["val"], g["node"])))
                 return body
@@ -758,6 +859,54 @@ class KernelBuilder:
                     add_valu_node(nodes, ("^", g["val"], g["val"], g["node"]), deps=[n7])
                 return
 
+            if mode == "d3":
+                for g in groups:
+                    n1 = add_valu_node(nodes, ("-", g["tmp1"], g["idx"], v_d3_offset))
+                    n2 = add_valu_node(nodes, ("&", g["tmp2"], g["tmp1"], v_one), deps=[n1])  # b0
+                    n3 = add_valu_node(nodes, (">>", g["tmp3"], g["tmp1"], v_one), deps=[n1])
+                    n4 = add_valu_node(nodes, ("&", g["addr"], g["tmp3"], v_one), deps=[n3])  # b1
+                    n5 = add_valu_node(nodes, (">>", g["tmp1"], g["tmp3"], v_one), deps=[n3])  # b2
+                    n6 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["tmp2"], v_d3_d70, v_d3_b8),
+                        deps=[n2],
+                    )
+                    n7 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d910, v_d3_b10),
+                        deps=[n2],
+                    )
+                    n8 = add_valu_node(nodes, ("-", g["tmp3"], g["tmp3"], g["node"]), deps=[n6, n7])
+                    n9 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["addr"], g["tmp3"], g["node"]),
+                        deps=[n4, n8],
+                    )
+                    n10 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d1112, v_d3_b12),
+                        deps=[n2],
+                    )
+                    n11 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["tmp2"], g["tmp2"], v_d3_d1314, v_d3_b14),
+                        deps=[n2],
+                    )
+                    n12 = add_valu_node(nodes, ("-", g["tmp2"], g["tmp2"], g["tmp3"]), deps=[n10, n11])
+                    n13 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["tmp3"], g["addr"], g["tmp2"], g["tmp3"]),
+                        deps=[n4, n12],
+                    )
+                    n14 = add_valu_node(nodes, ("-", g["tmp3"], g["tmp3"], g["node"]), deps=[n9, n13])
+                    n15 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["tmp1"], g["tmp3"], g["node"]),
+                        deps=[n5, n14],
+                    )
+                    add_valu_node(nodes, ("^", g["val"], g["val"], g["node"]), deps=[n15])
+                return
+
             # XOR depends on all gathers, so earliest start is next cycle after load cycles.
             for g in groups:
                 add_valu_node(
@@ -821,6 +970,9 @@ class KernelBuilder:
                 alu_frag = 4
             if VLEN % alu_frag != 0:
                 alu_frag = 4
+            # Empirically, sub-4 fragments can violate mixed hazard assumptions.
+            if alu_frag < 4:
+                alu_frag = 4
             alu_frag = min(alu_frag, SLOT_LIMITS["alu"])
 
             children = [[] for _ in nodes]
@@ -839,17 +991,35 @@ class KernelBuilder:
             # Track remaining lane fragments for decomposable VALU ops.
             # Splitting into smaller chunks helps pack ALU's 12 slots.
             alu_lane_frags = {}
-            for nid, node in enumerate(nodes):
-                if node["engine"] == "valu" and node.get("decomposable"):
-                    frags = []
-                    for lane_lo in range(0, VLEN, alu_frag):
-                        frags.append((lane_lo, lane_lo + alu_frag))
-                    alu_lane_frags[nid] = frags
+            dec_nids = [
+                nid
+                for nid, node in enumerate(nodes)
+                if node["engine"] == "valu" and node.get("decomposable")
+            ]
+            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "1.0"))
+            dec_limit_env = os.environ.get("PK_DEC_LIMIT")
+            if dec_limit_env is not None:
+                n_decompose = int(dec_limit_env)
+            else:
+                n_decompose = int(len(dec_nids) * alu_decomp_frac)
+            n_decompose = max(0, min(n_decompose, len(dec_nids)))
+            dec_nids.sort(key=lambda nid: crit[nid])
+            alu_eligible = set(dec_nids[:n_decompose])
+            dec_per_cycle = int(os.environ.get("PK_DEC_PER_CYCLE", "0"))
+            if dec_per_cycle <= 0:
+                dec_per_cycle = None
+            prefer_low_crit = os.environ.get("PK_ALU_LOW_CRIT", "1") != "0"
+            for nid in alu_eligible:
+                frags = []
+                for lane_lo in range(0, VLEN, alu_frag):
+                    frags.append((lane_lo, lane_lo + alu_frag))
+                alu_lane_frags[nid] = frags
 
             while pending:
                 cycle_idx = len(bundles)
                 ready_valu = []
                 ready_load = []
+                ready_store = []
                 for nid in pending:
                     node = nodes[nid]
                     if node.get("earliest", 0) > cycle_idx:
@@ -860,11 +1030,14 @@ class KernelBuilder:
                     ):
                         if node["engine"] == "valu":
                             ready_valu.append(nid)
+                        elif node["engine"] == "store":
+                            ready_store.append(nid)
                         else:
                             ready_load.append(nid)
 
                 ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 ready_load.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                ready_store.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
 
                 ready_valu_nondec = [
                     nid for nid in ready_valu if not nodes[nid].get("decomposable")
@@ -875,11 +1048,15 @@ class KernelBuilder:
 
                 chosen_valu = ready_valu_nondec[: SLOT_LIMITS["valu"]]
                 chosen_load = ready_load[: SLOT_LIMITS["load"]]
+                chosen_store = ready_store[: SLOT_LIMITS["store"]]
                 chosen_alu_frags = []
                 chosen_alu_nodes = set()
 
                 alu_slots_left = SLOT_LIMITS["alu"]
+                decomposed_ops_this_cycle = 0
                 while alu_slots_left >= alu_frag:
+                    if dec_per_cycle is not None and decomposed_ops_this_cycle >= dec_per_cycle:
+                        break
                     candidates = [
                         nid
                         for nid in ready_valu_dec
@@ -891,7 +1068,7 @@ class KernelBuilder:
                     candidates.sort(
                         key=lambda nid: (
                             0 if len(alu_lane_frags[nid]) == 1 else 1,
-                            -crit[nid],
+                            crit[nid] if prefer_low_crit else -crit[nid],
                             nodes[nid]["order"],
                         )
                     )
@@ -903,7 +1080,9 @@ class KernelBuilder:
                         break
                     alu_slots_left -= frag_width
                     chosen_alu_frags.append((nid, lane_lo, lane_hi))
-                    chosen_alu_nodes.add(nid)
+                    if nid not in chosen_alu_nodes:
+                        chosen_alu_nodes.add(nid)
+                        decomposed_ops_this_cycle += 1
 
                 valu_slots_left = SLOT_LIMITS["valu"] - len(chosen_valu)
                 if valu_slots_left > 0:
@@ -914,7 +1093,7 @@ class KernelBuilder:
                         if len(chosen_valu) >= SLOT_LIMITS["valu"]:
                             break
 
-                if not chosen_valu and not chosen_load and not chosen_alu_frags:
+                if not chosen_valu and not chosen_load and not chosen_store and not chosen_alu_frags:
                     raise RuntimeError("No schedulable ops in mixed scheduler")
 
                 alu_ops = []
@@ -927,6 +1106,7 @@ class KernelBuilder:
                     {
                         "valu": [nodes[nid]["op"] for nid in chosen_valu],
                         "load": [nodes[nid]["op"] for nid in chosen_load],
+                        "store": [nodes[nid]["op"] for nid in chosen_store],
                         "alu": alu_ops,
                     }
                 )
@@ -935,7 +1115,7 @@ class KernelBuilder:
                     for nid in chosen_alu_nodes
                     if len(alu_lane_frags.get(nid, [])) == 0
                 ]
-                for nid in chosen_valu + chosen_load + completed_alu_nodes:
+                for nid in chosen_valu + chosen_load + chosen_store + completed_alu_nodes:
                     pending.remove(nid)
                     done_cycle[nid] = cycle_idx
             return bundles
@@ -973,7 +1153,7 @@ class KernelBuilder:
                     last_writer[addr] = nid
                     last_readers[addr].clear()
 
-        def build_octet_schedule(groups):
+        def build_octet_schedule(groups, include_final_stores=False):
             nodes = []
             val_ready = [None] * len(groups)
             idx_ready = [None] * len(groups)
@@ -1066,6 +1246,120 @@ class KernelBuilder:
                             "valu",
                             ("^", g["val"], g["val"], g["node"]),
                             deps=deps_of(val_ready[gi], n7),
+                        )
+                    elif mode == "d3":
+                        n1 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp1"], g["idx"], v_d3_offset),
+                            deps=deps_of(idx_ready[gi]),
+                            earliest=start_earliest,
+                            decomposable=False,
+                        )
+                        n2 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("&", g["tmp2"], g["tmp1"], v_one),
+                            deps=[n1],
+                            decomposable=False,
+                        )
+                        n3 = add_sched_node(
+                            nodes,
+                            "valu",
+                            (">>", g["tmp3"], g["tmp1"], v_one),
+                            deps=[n1],
+                            decomposable=False,
+                        )
+                        n4 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("&", g["addr"], g["tmp3"], v_one),
+                            deps=[n3],
+                            decomposable=False,
+                        )
+                        n5 = add_sched_node(
+                            nodes,
+                            "valu",
+                            (">>", g["tmp1"], g["tmp3"], v_one),
+                            deps=[n3],
+                            decomposable=False,
+                        )
+                        n6 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["tmp2"], v_d3_d70, v_d3_b8),
+                            deps=[n2],
+                            decomposable=False,
+                        )
+                        n7 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d910, v_d3_b10),
+                            deps=[n2],
+                            decomposable=False,
+                        )
+                        n8 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp3"], g["tmp3"], g["node"]),
+                            deps=[n6, n7],
+                            decomposable=False,
+                        )
+                        n9 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["addr"], g["tmp3"], g["node"]),
+                            deps=[n4, n8],
+                            decomposable=False,
+                        )
+                        n10 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["tmp3"], g["tmp2"], v_d3_d1112, v_d3_b12),
+                            deps=[n2],
+                            decomposable=False,
+                        )
+                        n11 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["tmp2"], g["tmp2"], v_d3_d1314, v_d3_b14),
+                            deps=[n2],
+                            decomposable=False,
+                        )
+                        n12 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp2"], g["tmp2"], g["tmp3"]),
+                            deps=[n10, n11],
+                            decomposable=False,
+                        )
+                        n13 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["tmp3"], g["addr"], g["tmp2"], g["tmp3"]),
+                            deps=[n4, n12],
+                            decomposable=False,
+                        )
+                        n14 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp3"], g["tmp3"], g["node"]),
+                            deps=[n9, n13],
+                            decomposable=False,
+                        )
+                        n15 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["tmp1"], g["tmp3"], g["node"]),
+                            deps=[n5, n14],
+                            decomposable=False,
+                        )
+                        val_ready[gi] = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("^", g["val"], g["val"], g["node"]),
+                            deps=deps_of(val_ready[gi], n15),
+                            decomposable=False,
                         )
                     else:
                         n_addr = add_sched_node(
@@ -1160,6 +1454,16 @@ class KernelBuilder:
                                 deps=[n1, n2],
                             )
 
+            if include_final_stores:
+                for gi, g in enumerate(groups):
+                    add_sched_node(
+                        nodes,
+                        "store",
+                        ("vstore", val_ptrs[gi], g["val"]),
+                        deps=deps_of(val_ready[gi]),
+                        decomposable=False,
+                    )
+
             add_mixed_hazard_deps(nodes)
             return schedule_mixed_nodes(nodes)
 
@@ -1168,12 +1472,11 @@ class KernelBuilder:
             g_off_const = self.scratch_const(g_off_words)
             tail_body = []
 
-            tail_body.append(
-                ("alu", ("+", val_ptrs[0], inp_values_p, g_off_const))
-            )
+            # Build all per-group pointers from one base pointer.
+            tail_body.append(("alu", ("+", val_ptrs[0], inp_values_p, g_off_const)))
             for gi in range(1, group_count):
                 tail_body.append(
-                    ("alu", ("+", val_ptrs[gi], val_ptrs[gi - 1], vlen_const))
+                    ("alu", ("+", val_ptrs[gi], val_ptrs[0], val_ptr_offset_consts[gi]))
                 )
 
             # Assumes all initial indices are 0.
@@ -1201,73 +1504,179 @@ class KernelBuilder:
         # 8 groups so load-heavy gathers and hash chains can interleave freely.
         octet_groups = (n_groups // main_group_width) * main_group_width
         if octet_groups > 0:
-            self.add("load", ("const", loop_g_off, 0))
             active_groups = groups_all[:main_group_width]
             octet_batch = octet_groups * VLEN
-            loop_bound = (
-                batch_size_const
-                if octet_batch == batch_size
-                else self.scratch_const(octet_batch)
-            )
+            ptr_step_const = self.scratch_const(main_group_width * VLEN)
+            pairs = list(range(0, main_group_width, 2))
+            two_iter_special = octet_batch == batch_size and octet_groups == 2 * main_group_width
 
-            octet_body = []
+            def emit_iter_head(body):
+                # Assumes all initial indices are 0.
+                idx_ops = [("^", g["idx"], g["idx"], g["idx"]) for g in active_groups]
+                idx_cursor = 0
+                for gi in range(0, main_group_width, 2):
+                    valu_ops = None
+                    if idx_cursor < len(idx_ops):
+                        valu_ops = idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]]
+                        idx_cursor += SLOT_LIMITS["valu"]
+                    emit_bundle(
+                        body,
+                        valu=valu_ops,
+                        load=[
+                            ("vload", active_groups[gi]["val"], val_ptrs[gi]),
+                            ("vload", active_groups[gi + 1]["val"], val_ptrs[gi + 1]),
+                        ],
+                    )
+                while idx_cursor < len(idx_ops):
+                    emit_bundle(
+                        body,
+                        valu=idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]],
+                    )
+                    idx_cursor += SLOT_LIMITS["valu"]
 
-            emit_bundle(
-                octet_body,
-                alu=[
-                    ("+", val_ptrs[0], inp_values_p, loop_g_off),
-                ],
-            )
-            for gi in range(1, main_group_width):
-                emit_bundle(
-                    octet_body,
-                    alu=[
-                        ("+", val_ptrs[gi], val_ptrs[gi - 1], vlen_const),
-                    ],
+            # First-iteration pointer setup; later iterations roll pointers forward
+            # during store bundles.
+            if two_iter_special:
+                self.instrs.append({"flow": [("add_imm", val_ptrs[0], inp_values_p, 0)]})
+            else:
+                self.add("load", ("const", loop_g_off, 0))
+                self.instrs.append(
+                    {
+                        "alu": [
+                            ("+", val_ptrs[0], inp_values_p, loop_g_off),
+                        ]
+                    }
                 )
+            ptr_ops = [
+                ("+", val_ptrs[gi], val_ptrs[0], val_ptr_offset_consts[gi])
+                for gi in range(1, main_group_width)
+            ]
+            for i in range(0, len(ptr_ops), SLOT_LIMITS["alu"]):
+                self.instrs.append({"alu": ptr_ops[i : i + SLOT_LIMITS["alu"]]})
 
-            # Assumes all initial indices are 0.
-            emit_valu_chunked(
-                octet_body,
-                [("^", g["idx"], g["idx"], g["idx"]) for g in active_groups],
-            )
+            if two_iter_special:
+                schedule_bundles = build_octet_schedule(active_groups)
+                schedule_bundles_final = build_octet_schedule(active_groups, include_final_stores=True)
+                octet_body = []
 
-            for gi in range(0, main_group_width, 2):
+                # Iteration 0: head + compute.
+                emit_iter_head(octet_body)
+                for bundle in schedule_bundles:
+                    emit_bundle(
+                        octet_body,
+                        alu=bundle.get("alu"),
+                        valu=bundle["valu"],
+                        load=bundle["load"],
+                    )
+
+                # Turnaround: store iter0 and prefetch iter1 under stores.
+                idx_ops = [("^", g["idx"], g["idx"], g["idx"]) for g in active_groups]
+                idx_cursor = 0
+                for pi, gi in enumerate(pairs):
+                    load_ops = None
+                    if pi > 0:
+                        pgi = pairs[pi - 1]
+                        load_ops = [
+                            ("vload", active_groups[pgi]["val"], val_ptrs[pgi]),
+                            ("vload", active_groups[pgi + 1]["val"], val_ptrs[pgi + 1]),
+                        ]
+                    valu_ops = None
+                    if idx_cursor < len(idx_ops):
+                        valu_ops = idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]]
+                        idx_cursor += SLOT_LIMITS["valu"]
+                    emit_bundle(
+                        octet_body,
+                        alu=[
+                            ("+", val_ptrs[gi], val_ptrs[gi], ptr_step_const),
+                            ("+", val_ptrs[gi + 1], val_ptrs[gi + 1], ptr_step_const),
+                        ],
+                        valu=valu_ops,
+                        load=load_ops,
+                        store=[
+                            ("vstore", val_ptrs[gi], active_groups[gi]["val"]),
+                            ("vstore", val_ptrs[gi + 1], active_groups[gi + 1]["val"]),
+                        ],
+                    )
+
+                last_gi = pairs[-1]
+                final_valu = None
+                if idx_cursor < len(idx_ops):
+                    final_valu = idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]]
+                    idx_cursor += SLOT_LIMITS["valu"]
                 emit_bundle(
                     octet_body,
+                    valu=final_valu,
                     load=[
-                        ("vload", active_groups[gi]["val"], val_ptrs[gi]),
-                        ("vload", active_groups[gi + 1]["val"], val_ptrs[gi + 1]),
+                        ("vload", active_groups[last_gi]["val"], val_ptrs[last_gi]),
+                        ("vload", active_groups[last_gi + 1]["val"], val_ptrs[last_gi + 1]),
                     ],
                 )
+                while idx_cursor < len(idx_ops):
+                    emit_bundle(
+                        octet_body,
+                        valu=idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]],
+                    )
+                    idx_cursor += SLOT_LIMITS["valu"]
 
-            for bundle in build_octet_schedule(active_groups):
-                emit_bundle(
-                    octet_body,
-                    alu=bundle.get("alu"),
-                    valu=bundle["valu"],
-                    load=bundle["load"],
-                )
+                # Iteration 1: compute with final stores embedded in the DAG.
+                for bundle in schedule_bundles_final:
+                    emit_bundle(
+                        octet_body,
+                        alu=bundle.get("alu"),
+                        valu=bundle["valu"],
+                        load=bundle["load"],
+                        store=bundle.get("store"),
+                    )
 
-            for gi in range(0, main_group_width, 2):
-                flow_ops = (
-                    [("add_imm", loop_g_off, loop_g_off, main_group_width * VLEN)]
-                    if gi == main_group_width - 2
-                    else None
+                self.instrs.extend(octet_body)
+            else:
+                schedule_bundles = build_octet_schedule(active_groups)
+                loop_bound = (
+                    batch_size_const
+                    if octet_batch == batch_size
+                    else self.scratch_const(octet_batch)
                 )
-                emit_bundle(
-                    octet_body,
-                    store=[
-                        ("vstore", val_ptrs[gi], active_groups[gi]["val"]),
-                        ("vstore", val_ptrs[gi + 1], active_groups[gi + 1]["val"]),
-                    ],
-                    flow=flow_ops,
-                )
+                octet_body = []
 
-            octet_body_len = len(octet_body)
-            self.instrs.extend(octet_body)
-            self.instrs.append({"alu": [("<", cond, loop_g_off, loop_bound)]})
-            self.instrs.append({"flow": [("cond_jump_rel", cond, -(octet_body_len + 2))]})
+                emit_iter_head(octet_body)
+                compare_in_store = main_group_width >= 4
+                for bundle in schedule_bundles:
+                    emit_bundle(
+                        octet_body,
+                        alu=bundle.get("alu"),
+                        valu=bundle["valu"],
+                        load=bundle["load"],
+                    )
+
+                for gi in pairs:
+                    flow_ops = (
+                        [("add_imm", loop_g_off, loop_g_off, main_group_width * VLEN)]
+                        if gi == 0
+                        else None
+                    )
+                    alu_ops = [
+                        ("+", val_ptrs[gi], val_ptrs[gi], ptr_step_const),
+                        ("+", val_ptrs[gi + 1], val_ptrs[gi + 1], ptr_step_const),
+                    ]
+                    if compare_in_store and gi == 2:
+                        alu_ops.append(("<", cond, loop_g_off, loop_bound))
+                    emit_bundle(
+                        octet_body,
+                        alu=alu_ops,
+                        store=[
+                            ("vstore", val_ptrs[gi], active_groups[gi]["val"]),
+                            ("vstore", val_ptrs[gi + 1], active_groups[gi + 1]["val"]),
+                        ],
+                        flow=flow_ops,
+                    )
+
+                octet_body_len = len(octet_body)
+                self.instrs.extend(octet_body)
+                loop_back_span = octet_body_len + 1
+                if not compare_in_store:
+                    self.instrs.append({"alu": [("<", cond, loop_g_off, loop_bound)]})
+                    loop_back_span += 1
+                self.instrs.append({"flow": [("cond_jump_rel", cond, -loop_back_span)]})
 
         processed_groups = octet_groups
         remaining_groups = n_groups - processed_groups
@@ -1285,6 +1694,27 @@ class KernelBuilder:
 
         if remaining_groups == 1:
             emit_tail_groups(1, tail_g_off)
+
+        # Repack any serialized one-slot runs into VLIW bundles without reordering.
+        repacked = []
+        run_slots = []
+
+        def flush_run():
+            nonlocal run_slots
+            if run_slots:
+                repacked.extend(self.build(run_slots))
+                run_slots = []
+
+        for instr in self.instrs:
+            if len(instr) == 1:
+                engine, ops = next(iter(instr.items()))
+                if len(ops) == 1:
+                    run_slots.append((engine, ops[0]))
+                    continue
+            flush_run()
+            repacked.append(instr)
+        flush_run()
+        self.instrs = repacked
 
         # No pauses in the submission path; we validate against final memory.
 

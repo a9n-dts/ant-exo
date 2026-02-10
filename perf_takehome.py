@@ -235,7 +235,6 @@ class KernelBuilder:
             self.add("load", ("load", self.scratch[v], tmp1))
 
         # Scalar constants
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
@@ -255,13 +254,11 @@ class KernelBuilder:
         v_addr_b = self.alloc_scratch("v_addr_b", VLEN)
 
         # Vector constants (broadcast from scalars)
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_fvp = self.alloc_scratch("v_fvp", VLEN)
 
-        self.add("valu", ("vbroadcast", v_zero, zero_const))
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
@@ -307,12 +304,14 @@ class KernelBuilder:
             pair_body.append(("load", ("vload", v_idx_b, tmp3)))
             pair_body.append(("load", ("vload", v_val_b, tmp4)))
 
-            for _ in range(rounds):
-                pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
-                pair_body.append(("valu", ("+", v_addr_b, v_fvp, v_idx_b)))
-                for offset in range(VLEN):
-                    pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
+            # Prologue: gather group A for round 0.
+            pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
+            for offset in range(VLEN):
+                pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
 
+            for round_i in range(rounds):
+                # Gather B(round_i) while hashing A(round_i).
+                pair_body.append(("valu", ("+", v_addr_b, v_fvp, v_idx_b)))
                 pair_body.append(("valu", ("^", v_val_a, v_val_a, v_node_val_a)))
 
                 b_load_offset = 0
@@ -332,20 +331,32 @@ class KernelBuilder:
                 pair_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
                 pair_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
                 pair_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
-                pair_body.append(("flow", ("vselect", v_idx_a, v_tmp1_a, v_idx_a, v_zero)))
+                pair_body.append(("valu", ("*", v_idx_a, v_idx_a, v_tmp1_a)))
+
+                # If there is another round, gather A(round_i+1) while hashing B(round_i).
+                has_next_round = round_i + 1 < rounds
+                if has_next_round:
+                    pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
 
                 pair_body.append(("valu", ("^", v_val_b, v_val_b, v_node_val_b)))
+                a_load_offset = 0
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     vc1, vc3 = v_hash_consts[hi]
                     pair_body.append(("valu", (op1, v_tmp1_b, v_val_b, vc1)))
                     pair_body.append(("valu", (op3, v_tmp2_b, v_val_b, vc3)))
+                    if has_next_round and a_load_offset < VLEN:
+                        pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, a_load_offset)))
+                        a_load_offset += 1
+                    if has_next_round and a_load_offset < VLEN:
+                        pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, a_load_offset)))
+                        a_load_offset += 1
                     pair_body.append(("valu", (op2, v_val_b, v_tmp1_b, v_tmp2_b)))
 
                 pair_body.append(("valu", ("&", v_tmp1_b, v_val_b, v_one)))
                 pair_body.append(("valu", ("multiply_add", v_idx_b, v_idx_b, v_two, v_one)))
                 pair_body.append(("valu", ("+", v_idx_b, v_idx_b, v_tmp1_b)))
                 pair_body.append(("valu", ("<", v_tmp1_b, v_idx_b, v_n_nodes)))
-                pair_body.append(("flow", ("vselect", v_idx_b, v_tmp1_b, v_idx_b, v_zero)))
+                pair_body.append(("valu", ("*", v_idx_b, v_idx_b, v_tmp1_b)))
 
             pair_body.append(("store", ("vstore", tmp1, v_idx_a)))
             pair_body.append(("store", ("vstore", tmp2, v_val_a)))
@@ -382,7 +393,7 @@ class KernelBuilder:
                 tail_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
                 tail_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
                 tail_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
-                tail_body.append(("flow", ("vselect", v_idx_a, v_tmp1_a, v_idx_a, v_zero)))
+                tail_body.append(("valu", ("*", v_idx_a, v_idx_a, v_tmp1_a)))
 
             tail_body.append(("store", ("vstore", tmp1, v_idx_a)))
             tail_body.append(("store", ("vstore", tmp2, v_val_a)))

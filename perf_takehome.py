@@ -210,7 +210,6 @@ class KernelBuilder:
         Processes VLEN=8 batch elements per vector instruction.
         """
         assert batch_size % VLEN == 0, f"batch_size must be a multiple of VLEN={VLEN}"
-        n_groups = batch_size // VLEN
 
         # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
@@ -270,60 +269,59 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", v_c3, s_c3))
             v_hash_consts.append((v_c1, v_c3))
 
-        # Pre-allocate group offset constants (0, 8, 16, ..., (n_groups-1)*8)
-        group_offsets = []
-        for g in range(n_groups):
-            group_offsets.append(self.scratch_const(g * VLEN))
+        # Loop variables
+        loop_g_off = self.alloc_scratch("loop_g_off")
+        cond = self.alloc_scratch("cond")
+
+        # Initialize group loop counter
+        self.add("load", ("const", loop_g_off, 0))
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting vectorized loop"))
 
-        body = []  # flat list of (engine, slot) tuples for build()
+        # Group body: load once, run all rounds in registers, store once.
+        group_body = []
+        group_body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], loop_g_off)))
+        group_body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], loop_g_off)))
+        group_body.append(("load", ("vload", v_idx, tmp1)))
+        group_body.append(("load", ("vload", v_val, tmp2)))
 
-        for round_idx in range(rounds):
-            for g in range(n_groups):
-                g_off = group_offsets[g]
+        for _ in range(rounds):
+            # --- Gather tree node values ---
+            group_body.append(("valu", ("+", v_addr, v_fvp, v_idx)))
+            for offset in range(VLEN):
+                group_body.append(("load", ("load_offset", v_node_val, v_addr, offset)))
 
-                # --- Load indices and values (vload) ---
-                body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], g_off)))
-                body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], g_off)))
-                body.append(("load", ("vload", v_idx, tmp1)))
-                body.append(("load", ("vload", v_val, tmp2)))
+            # --- XOR with node values ---
+            group_body.append(("valu", ("^", v_val, v_val, v_node_val)))
 
-                # --- Gather tree node values ---
-                body.append(("valu", ("+", v_addr, v_fvp, v_idx)))
-                for offset in range(VLEN):
-                    body.append(("load", ("load_offset", v_node_val, v_addr, offset)))
+            # --- Hash (6 stages, each 3 valu ops) ---
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc3 = v_hash_consts[hi]
+                group_body.append(("valu", (op1, v_tmp1, v_val, vc1)))
+                group_body.append(("valu", (op3, v_tmp2, v_val, vc3)))
+                group_body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
 
-                # --- XOR with node values ---
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+            # --- Index update: idx = 2*idx + 1 + (val & 1) ---
+            group_body.append(("valu", ("&", v_tmp1, v_val, v_one)))
+            group_body.append(("valu", ("multiply_add", v_idx, v_idx, v_two, v_one)))
+            group_body.append(("valu", ("+", v_idx, v_idx, v_tmp1)))
 
-                # --- Hash (6 stages, each 3 valu ops) ---
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    vc1, vc3 = v_hash_consts[hi]
-                    body.append(("valu", (op1, v_tmp1, v_val, vc1)))
-                    body.append(("valu", (op3, v_tmp2, v_val, vc3)))
-                    body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
+            # --- Index wrap: idx = 0 if idx >= n_nodes else idx ---
+            group_body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+            group_body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
 
-                # --- Index update: idx = 2*idx + (1 if val%2==0 else 2) ---
-                body.append(("valu", ("%", v_tmp1, v_val, v_two)))
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                body.append(("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two)))
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
+        group_body.append(("store", ("vstore", tmp1, v_idx)))
+        group_body.append(("store", ("vstore", tmp2, v_val)))
+        group_body.append(("flow", ("add_imm", loop_g_off, loop_g_off, VLEN)))
 
-                # --- Index wrap: idx = 0 if idx >= n_nodes else idx ---
-                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+        group_body_instrs = self.build(group_body)
+        group_body_len = len(group_body_instrs)
+        self.instrs.extend(group_body_instrs)
 
-                # --- Store results ---
-                body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], g_off)))
-                body.append(("store", ("vstore", tmp1, v_idx)))
-                body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], g_off)))
-                body.append(("store", ("vstore", tmp2, v_val)))
+        # Group loop control: iterate over all VLEN-sized groups.
+        self.instrs.append({"alu": [("<", cond, loop_g_off, self.scratch["batch_size"])]})
+        self.instrs.append({"flow": [("cond_jump_rel", cond, -(group_body_len + 2))]})
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 

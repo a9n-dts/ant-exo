@@ -321,6 +321,36 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_d1_r, node_d1_r))
         self.add("valu", ("-", v_d1_delta, v_d1_l, v_d1_r))
 
+        # Depth-2 pre-computation: load tree[3..6], compute deltas
+        node_d2_3 = self.alloc_scratch("node_d2_3")
+        node_d2_4 = self.alloc_scratch("node_d2_4")
+        node_d2_5 = self.alloc_scratch("node_d2_5")
+        node_d2_6 = self.alloc_scratch("node_d2_6")
+        delta_lo_s = self.alloc_scratch("delta_lo_s")
+        delta_hi_s = self.alloc_scratch("delta_hi_s")
+        v_d2_tree3 = self.alloc_scratch("v_d2_tree3", VLEN)
+        v_d2_tree5 = self.alloc_scratch("v_d2_tree5", VLEN)
+        v_d2_delta_lo = self.alloc_scratch("v_d2_delta_lo", VLEN)
+        v_d2_delta_hi = self.alloc_scratch("v_d2_delta_hi", VLEN)
+        v_d2_offset = self.alloc_scratch("v_d2_offset", VLEN)
+        three_const = self.scratch_const(3)
+
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 3))
+        self.add("load", ("load", node_d2_3, node_addr))
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 4))
+        self.add("load", ("load", node_d2_4, node_addr))
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 5))
+        self.add("load", ("load", node_d2_5, node_addr))
+        self.add("flow", ("add_imm", node_addr, forest_values_p, 6))
+        self.add("load", ("load", node_d2_6, node_addr))
+        self.add("alu", ("-", delta_lo_s, node_d2_4, node_d2_3))
+        self.add("alu", ("-", delta_hi_s, node_d2_6, node_d2_5))
+        self.add("valu", ("vbroadcast", v_d2_tree3, node_d2_3))
+        self.add("valu", ("vbroadcast", v_d2_tree5, node_d2_5))
+        self.add("valu", ("vbroadcast", v_d2_delta_lo, delta_lo_s))
+        self.add("valu", ("vbroadcast", v_d2_delta_hi, delta_hi_s))
+        self.add("valu", ("vbroadcast", v_d2_offset, three_const))
+
         # Broadcast hash stage constants to vectors and precompute simplified stages.
         # For stages of the form (a + c1) + (a << k), use multiply_add:
         # a = a * (2^k + 1) + c1
@@ -433,6 +463,8 @@ class KernelBuilder:
                 return "root"
             if depth == 1:
                 return "d1"
+            if depth == 2:
+                return "d2"
             return "gather"
 
         def gather_slots_inphase(groups, round_idx):
@@ -449,6 +481,24 @@ class KernelBuilder:
                     body.append(
                         ("valu", ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r))
                     )
+                for g in groups:
+                    body.append(("valu", ("^", g["val"], g["val"], g["node"])))
+                return body
+            if mode == "d2":
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp1"], g["idx"], v_d2_offset)))
+                for g in groups:
+                    body.append(("valu", ("&", g["tmp2"], g["tmp1"], v_one)))
+                for g in groups:
+                    body.append(("valu", (">>", g["addr"], g["tmp1"], v_one)))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["node"], g["tmp2"], v_d2_delta_lo, v_d2_tree3)))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["tmp1"], g["tmp2"], v_d2_delta_hi, v_d2_tree5)))
+                for g in groups:
+                    body.append(("valu", ("-", g["tmp2"], g["tmp1"], g["node"])))
+                for g in groups:
+                    body.append(("valu", ("multiply_add", g["node"], g["addr"], g["tmp2"], g["node"])))
                 for g in groups:
                     body.append(("valu", ("^", g["val"], g["val"], g["node"])))
                 return body
@@ -663,6 +713,30 @@ class KernelBuilder:
                     add_valu_node(nodes, ("^", g["val"], g["val"], g["node"]), deps=[n2])
                 return
 
+            if mode == "d2":
+                for g in groups:
+                    n1 = add_valu_node(nodes, ("-", g["tmp1"], g["idx"], v_d2_offset))
+                    n2 = add_valu_node(nodes, ("&", g["tmp2"], g["tmp1"], v_one), deps=[n1])
+                    n3 = add_valu_node(nodes, (">>", g["addr"], g["tmp1"], v_one), deps=[n1])
+                    n4 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["tmp2"], v_d2_delta_lo, v_d2_tree3),
+                        deps=[n2],
+                    )
+                    n5 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["tmp1"], g["tmp2"], v_d2_delta_hi, v_d2_tree5),
+                        deps=[n2, n3],  # n3 reads tmp1 (local); n5 overwrites it (pair_hi)
+                    )
+                    n6 = add_valu_node(nodes, ("-", g["tmp2"], g["tmp1"], g["node"]), deps=[n4, n5])
+                    n7 = add_valu_node(
+                        nodes,
+                        ("multiply_add", g["node"], g["addr"], g["tmp2"], g["node"]),
+                        deps=[n3, n6],
+                    )
+                    add_valu_node(nodes, ("^", g["val"], g["val"], g["node"]), deps=[n7])
+                return
+
             # XOR depends on all gathers, so earliest start is next cycle after load cycles.
             for g in groups:
                 add_valu_node(
@@ -703,13 +777,16 @@ class KernelBuilder:
             for ops in schedule_valu_nodes(nodes):
                 emit_bundle(body, valu=ops)
 
-        def add_sched_node(nodes, engine, op, deps=None):
+        def add_sched_node(nodes, engine, op, deps=None, decomposable=None):
+            if decomposable is None:
+                decomposable = engine == "valu" and op[0] not in ("multiply_add", "vbroadcast")
             nodes.append(
                 {
                     "engine": engine,
                     "op": op,
                     "deps": [] if deps is None else deps,
                     "order": len(nodes),
+                    "decomposable": decomposable,
                 }
             )
             return len(nodes) - 1
@@ -750,19 +827,27 @@ class KernelBuilder:
                 ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 ready_load.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 chosen_valu = ready_valu[: SLOT_LIMITS["valu"]]
+
+                # Spill 1 extra decomposable op to ALU engine (8 scalar ALU ops fit in 12 slots)
+                chosen_set = set(chosen_valu)
+                remaining = [nid for nid in ready_valu if nid not in chosen_set]
+                chosen_alu_vec = [
+                    nid for nid in remaining if nodes[nid].get("decomposable")
+                ][:1]
+
                 chosen_load = ready_load[: SLOT_LIMITS["load"]]
 
-                if not chosen_valu and not chosen_load:
-                    # Should not happen with this DAG construction.
+                if not chosen_valu and not chosen_load and not chosen_alu_vec:
                     raise RuntimeError("No schedulable ops in mixed scheduler")
 
                 bundles.append(
                     {
                         "valu": [nodes[nid]["op"] for nid in chosen_valu],
                         "load": [nodes[nid]["op"] for nid in chosen_load],
+                        "alu_vec": [nodes[nid]["op"] for nid in chosen_alu_vec],
                     }
                 )
-                for nid in chosen_valu + chosen_load:
+                for nid in chosen_valu + chosen_load + chosen_alu_vec:
                     pending.remove(nid)
                     done_cycle[nid] = cycle_idx
             return bundles
@@ -803,6 +888,55 @@ class KernelBuilder:
                             "valu",
                             ("^", g["val"], g["val"], g["node"]),
                             deps=deps_of(val_ready[gi], n2),
+                        )
+                    elif mode == "d2":
+                        n1 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp1"], g["idx"], v_d2_offset),
+                            deps=deps_of(idx_ready[gi]),
+                        )
+                        n2 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("&", g["tmp2"], g["tmp1"], v_one),
+                            deps=[n1],
+                        )
+                        n3 = add_sched_node(
+                            nodes,
+                            "valu",
+                            (">>", g["addr"], g["tmp1"], v_one),
+                            deps=[n1],
+                        )
+                        n4 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["tmp2"], v_d2_delta_lo, v_d2_tree3),
+                            deps=[n2],
+                        )
+                        n5 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["tmp1"], g["tmp2"], v_d2_delta_hi, v_d2_tree5),
+                            deps=[n2, n3],  # n3 reads tmp1 (local); n5 overwrites it (pair_hi)
+                        )
+                        n6 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("-", g["tmp2"], g["tmp1"], g["node"]),
+                            deps=[n4, n5],
+                        )
+                        n7 = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("multiply_add", g["node"], g["addr"], g["tmp2"], g["node"]),
+                            deps=[n3, n6],
+                        )
+                        val_ready[gi] = add_sched_node(
+                            nodes,
+                            "valu",
+                            ("^", g["val"], g["val"], g["node"]),
+                            deps=deps_of(val_ready[gi], n7),
                         )
                     else:
                         n_addr = add_sched_node(
@@ -976,7 +1110,17 @@ class KernelBuilder:
                 )
 
             for bundle in build_octet_schedule(groups_all):
-                emit_bundle(octet_body, valu=bundle["valu"], load=bundle["load"])
+                alu_ops = []
+                for op_tuple in bundle.get("alu_vec", []):
+                    op, dest, a1, a2 = op_tuple
+                    for i in range(VLEN):
+                        alu_ops.append((op, dest + i, a1 + i, a2 + i))
+                emit_bundle(
+                    octet_body,
+                    alu=alu_ops or None,
+                    valu=bundle["valu"],
+                    load=bundle["load"],
+                )
 
             for gi in range(0, 8, 2):
                 flow_ops = (

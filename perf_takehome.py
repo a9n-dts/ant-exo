@@ -210,11 +210,13 @@ class KernelBuilder:
         Processes VLEN=8 batch elements per vector instruction.
         """
         assert batch_size % VLEN == 0, f"batch_size must be a multiple of VLEN={VLEN}"
+        n_groups = batch_size // VLEN
 
         # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
+        tmp4 = self.alloc_scratch("tmp4")
 
         # Load init vars from memory header
         init_vars = [
@@ -237,13 +239,20 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Vector work registers (VLEN=8 words each)
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
+        # Vector work registers for two interleaved groups (VLEN=8 words each)
+        v_idx_a = self.alloc_scratch("v_idx_a", VLEN)
+        v_val_a = self.alloc_scratch("v_val_a", VLEN)
+        v_node_val_a = self.alloc_scratch("v_node_val_a", VLEN)
+        v_tmp1_a = self.alloc_scratch("v_tmp1_a", VLEN)
+        v_tmp2_a = self.alloc_scratch("v_tmp2_a", VLEN)
+        v_addr_a = self.alloc_scratch("v_addr_a", VLEN)
+
+        v_idx_b = self.alloc_scratch("v_idx_b", VLEN)
+        v_val_b = self.alloc_scratch("v_val_b", VLEN)
+        v_node_val_b = self.alloc_scratch("v_node_val_b", VLEN)
+        v_tmp1_b = self.alloc_scratch("v_tmp1_b", VLEN)
+        v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
+        v_addr_b = self.alloc_scratch("v_addr_b", VLEN)
 
         # Vector constants (broadcast from scalars)
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -272,55 +281,112 @@ class KernelBuilder:
         # Loop variables
         loop_g_off = self.alloc_scratch("loop_g_off")
         cond = self.alloc_scratch("cond")
-
-        # Initialize group loop counter
-        self.add("load", ("const", loop_g_off, 0))
+        vlen_const = self.scratch_const(VLEN)
+        two_vlen = 2 * VLEN
 
         self.add("flow", ("pause",))
 
-        # Group body: load once, run all rounds in registers, store once.
-        group_body = []
-        group_body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], loop_g_off)))
-        group_body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], loop_g_off)))
-        group_body.append(("load", ("vload", v_idx, tmp1)))
-        group_body.append(("load", ("vload", v_val, tmp2)))
+        # Process two vector groups per iteration to overlap gather(load) with hash(valu).
+        paired_groups = (n_groups // 2) * 2
+        if paired_groups > 0:
+            self.add("load", ("const", loop_g_off, 0))
+            paired_batch = paired_groups * VLEN
+            loop_bound = (
+                self.scratch["batch_size"]
+                if paired_batch == batch_size
+                else self.scratch_const(paired_batch)
+            )
 
-        for _ in range(rounds):
-            # --- Gather tree node values ---
-            group_body.append(("valu", ("+", v_addr, v_fvp, v_idx)))
-            for offset in range(VLEN):
-                group_body.append(("load", ("load_offset", v_node_val, v_addr, offset)))
+            pair_body = []
+            pair_body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], loop_g_off)))
+            pair_body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], loop_g_off)))
+            pair_body.append(("alu", ("+", tmp3, tmp1, vlen_const)))
+            pair_body.append(("alu", ("+", tmp4, tmp2, vlen_const)))
+            pair_body.append(("load", ("vload", v_idx_a, tmp1)))
+            pair_body.append(("load", ("vload", v_val_a, tmp2)))
+            pair_body.append(("load", ("vload", v_idx_b, tmp3)))
+            pair_body.append(("load", ("vload", v_val_b, tmp4)))
 
-            # --- XOR with node values ---
-            group_body.append(("valu", ("^", v_val, v_val, v_node_val)))
+            for _ in range(rounds):
+                pair_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
+                pair_body.append(("valu", ("+", v_addr_b, v_fvp, v_idx_b)))
+                for offset in range(VLEN):
+                    pair_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
 
-            # --- Hash (6 stages, each 3 valu ops) ---
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                vc1, vc3 = v_hash_consts[hi]
-                group_body.append(("valu", (op1, v_tmp1, v_val, vc1)))
-                group_body.append(("valu", (op3, v_tmp2, v_val, vc3)))
-                group_body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
+                pair_body.append(("valu", ("^", v_val_a, v_val_a, v_node_val_a)))
 
-            # --- Index update: idx = 2*idx + 1 + (val & 1) ---
-            group_body.append(("valu", ("&", v_tmp1, v_val, v_one)))
-            group_body.append(("valu", ("multiply_add", v_idx, v_idx, v_two, v_one)))
-            group_body.append(("valu", ("+", v_idx, v_idx, v_tmp1)))
+                b_load_offset = 0
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    vc1, vc3 = v_hash_consts[hi]
+                    pair_body.append(("valu", (op1, v_tmp1_a, v_val_a, vc1)))
+                    pair_body.append(("valu", (op3, v_tmp2_a, v_val_a, vc3)))
+                    if b_load_offset < VLEN:
+                        pair_body.append(("load", ("load_offset", v_node_val_b, v_addr_b, b_load_offset)))
+                        b_load_offset += 1
+                    if b_load_offset < VLEN:
+                        pair_body.append(("load", ("load_offset", v_node_val_b, v_addr_b, b_load_offset)))
+                        b_load_offset += 1
+                    pair_body.append(("valu", (op2, v_val_a, v_tmp1_a, v_tmp2_a)))
 
-            # --- Index wrap: idx = 0 if idx >= n_nodes else idx ---
-            group_body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-            group_body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+                pair_body.append(("valu", ("&", v_tmp1_a, v_val_a, v_one)))
+                pair_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
+                pair_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
+                pair_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
+                pair_body.append(("flow", ("vselect", v_idx_a, v_tmp1_a, v_idx_a, v_zero)))
 
-        group_body.append(("store", ("vstore", tmp1, v_idx)))
-        group_body.append(("store", ("vstore", tmp2, v_val)))
-        group_body.append(("flow", ("add_imm", loop_g_off, loop_g_off, VLEN)))
+                pair_body.append(("valu", ("^", v_val_b, v_val_b, v_node_val_b)))
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    vc1, vc3 = v_hash_consts[hi]
+                    pair_body.append(("valu", (op1, v_tmp1_b, v_val_b, vc1)))
+                    pair_body.append(("valu", (op3, v_tmp2_b, v_val_b, vc3)))
+                    pair_body.append(("valu", (op2, v_val_b, v_tmp1_b, v_tmp2_b)))
 
-        group_body_instrs = self.build(group_body)
-        group_body_len = len(group_body_instrs)
-        self.instrs.extend(group_body_instrs)
+                pair_body.append(("valu", ("&", v_tmp1_b, v_val_b, v_one)))
+                pair_body.append(("valu", ("multiply_add", v_idx_b, v_idx_b, v_two, v_one)))
+                pair_body.append(("valu", ("+", v_idx_b, v_idx_b, v_tmp1_b)))
+                pair_body.append(("valu", ("<", v_tmp1_b, v_idx_b, v_n_nodes)))
+                pair_body.append(("flow", ("vselect", v_idx_b, v_tmp1_b, v_idx_b, v_zero)))
 
-        # Group loop control: iterate over all VLEN-sized groups.
-        self.instrs.append({"alu": [("<", cond, loop_g_off, self.scratch["batch_size"])]})
-        self.instrs.append({"flow": [("cond_jump_rel", cond, -(group_body_len + 2))]})
+            pair_body.append(("store", ("vstore", tmp1, v_idx_a)))
+            pair_body.append(("store", ("vstore", tmp2, v_val_a)))
+            pair_body.append(("store", ("vstore", tmp3, v_idx_b)))
+            pair_body.append(("store", ("vstore", tmp4, v_val_b)))
+            pair_body.append(("flow", ("add_imm", loop_g_off, loop_g_off, two_vlen)))
+
+            pair_body_instrs = self.build(pair_body)
+            pair_body_len = len(pair_body_instrs)
+            self.instrs.extend(pair_body_instrs)
+            self.instrs.append({"alu": [("<", cond, loop_g_off, loop_bound)]})
+            self.instrs.append({"flow": [("cond_jump_rel", cond, -(pair_body_len + 2))]})
+
+        # Tail for odd number of groups (if any): process the final single group.
+        if n_groups % 2 == 1:
+            tail_g_off = self.scratch_const(paired_groups * VLEN)
+            tail_body = []
+            tail_body.append(("alu", ("+", tmp1, self.scratch["inp_indices_p"], tail_g_off)))
+            tail_body.append(("alu", ("+", tmp2, self.scratch["inp_values_p"], tail_g_off)))
+            tail_body.append(("load", ("vload", v_idx_a, tmp1)))
+            tail_body.append(("load", ("vload", v_val_a, tmp2)))
+
+            for _ in range(rounds):
+                tail_body.append(("valu", ("+", v_addr_a, v_fvp, v_idx_a)))
+                for offset in range(VLEN):
+                    tail_body.append(("load", ("load_offset", v_node_val_a, v_addr_a, offset)))
+                tail_body.append(("valu", ("^", v_val_a, v_val_a, v_node_val_a)))
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    vc1, vc3 = v_hash_consts[hi]
+                    tail_body.append(("valu", (op1, v_tmp1_a, v_val_a, vc1)))
+                    tail_body.append(("valu", (op3, v_tmp2_a, v_val_a, vc3)))
+                    tail_body.append(("valu", (op2, v_val_a, v_tmp1_a, v_tmp2_a)))
+                tail_body.append(("valu", ("&", v_tmp1_a, v_val_a, v_one)))
+                tail_body.append(("valu", ("multiply_add", v_idx_a, v_idx_a, v_two, v_one)))
+                tail_body.append(("valu", ("+", v_idx_a, v_idx_a, v_tmp1_a)))
+                tail_body.append(("valu", ("<", v_tmp1_a, v_idx_a, v_n_nodes)))
+                tail_body.append(("flow", ("vselect", v_idx_a, v_tmp1_a, v_idx_a, v_zero)))
+
+            tail_body.append(("store", ("vstore", tmp1, v_idx_a)))
+            tail_body.append(("store", ("vstore", tmp2, v_val_a)))
+            self.instrs.extend(self.build(tail_body))
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})

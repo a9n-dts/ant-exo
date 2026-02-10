@@ -996,7 +996,7 @@ class KernelBuilder:
                 for nid, node in enumerate(nodes)
                 if node["engine"] == "valu" and node.get("decomposable")
             ]
-            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "0.988"))
+            alu_decomp_frac = float(os.environ.get("PK_ALU_DECOMP", "0.9885"))
             dec_limit_env = os.environ.get("PK_DEC_LIMIT")
             if dec_limit_env is not None:
                 n_decompose = int(dec_limit_env)
@@ -1020,6 +1020,7 @@ class KernelBuilder:
                 ready_valu = []
                 ready_load = []
                 ready_store = []
+                ready_flow = []
                 for nid in pending:
                     node = nodes[nid]
                     if node.get("earliest", 0) > cycle_idx:
@@ -1032,11 +1033,14 @@ class KernelBuilder:
                             ready_valu.append(nid)
                         elif node["engine"] == "store":
                             ready_store.append(nid)
+                        elif node["engine"] == "flow":
+                            ready_flow.append(nid)
                         else:
                             ready_load.append(nid)
 
                 ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 ready_store.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                ready_flow.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 # For gather-heavy phases, finishing all 8 lane loads for one
                 # destination vector tends to unblock VALU earlier than spraying
                 # loads across many groups.
@@ -1071,6 +1075,7 @@ class KernelBuilder:
                 chosen_valu = ready_valu_nondec[: SLOT_LIMITS["valu"]]
                 chosen_load = ready_load[: SLOT_LIMITS["load"]]
                 chosen_store = ready_store[: SLOT_LIMITS["store"]]
+                chosen_flow = ready_flow[: SLOT_LIMITS["flow"]]
                 chosen_alu_frags = []
                 chosen_alu_nodes = set()
 
@@ -1131,7 +1136,13 @@ class KernelBuilder:
                         if len(chosen_valu) >= SLOT_LIMITS["valu"]:
                             break
 
-                if not chosen_valu and not chosen_load and not chosen_store and not chosen_alu_frags:
+                if (
+                    not chosen_valu
+                    and not chosen_load
+                    and not chosen_store
+                    and not chosen_flow
+                    and not chosen_alu_frags
+                ):
                     raise RuntimeError("No schedulable ops in mixed scheduler")
 
                 alu_ops = []
@@ -1145,6 +1156,7 @@ class KernelBuilder:
                         "valu": [nodes[nid]["op"] for nid in chosen_valu],
                         "load": [nodes[nid]["op"] for nid in chosen_load],
                         "store": [nodes[nid]["op"] for nid in chosen_store],
+                        "flow": [nodes[nid]["op"] for nid in chosen_flow],
                         "alu": alu_ops,
                     }
                 )
@@ -1153,7 +1165,9 @@ class KernelBuilder:
                     for nid in chosen_alu_nodes
                     if len(alu_lane_frags.get(nid, [])) == 0
                 ]
-                for nid in chosen_valu + chosen_load + chosen_store + completed_alu_nodes:
+                for nid in (
+                    chosen_valu + chosen_load + chosen_store + chosen_flow + completed_alu_nodes
+                ):
                     pending.remove(nid)
                     done_cycle[nid] = cycle_idx
             return bundles
@@ -1191,12 +1205,25 @@ class KernelBuilder:
                     last_writer[addr] = nid
                     last_readers[addr].clear()
 
-        def build_octet_schedule(groups, include_final_stores=False):
+        def build_octet_schedule(groups, include_final_stores=False, include_vloads=False):
             nodes = []
             val_ready = [None] * len(groups)
             idx_ready = [None] * len(groups)
             skew_gap = int(os.environ.get("PK_SKEW_GAP", "0"))
             skew_period = max(1, int(os.environ.get("PK_SKEW_PERIOD", "4")))
+
+            # Fold vloads and idx-zeros into the DAG so they overlap with
+            # early arithmetic rounds (load engine idle during root/d1/d2).
+            if include_vloads:
+                for gi, g in enumerate(groups):
+                    val_ready[gi] = add_sched_node(
+                        nodes, "load", ("vload", g["val"], val_ptrs[gi]),
+                        decomposable=False,
+                    )
+                    idx_ready[gi] = add_sched_node(
+                        nodes, "valu", ("^", g["idx"], g["idx"], g["idx"]),
+                        decomposable=False,
+                    )
 
             def deps_of(*deps):
                 return [dep for dep in deps if dep is not None]
@@ -1593,70 +1620,34 @@ class KernelBuilder:
                 self.instrs.append({"alu": ptr_ops[i : i + SLOT_LIMITS["alu"]]})
 
             if two_iter_special:
-                schedule_bundles = build_octet_schedule(active_groups)
-                schedule_bundles_final = build_octet_schedule(active_groups, include_final_stores=True)
+                schedule_bundles = build_octet_schedule(
+                    active_groups, include_final_stores=True, include_vloads=True,
+                )
+                schedule_bundles_final = build_octet_schedule(
+                    active_groups, include_final_stores=True, include_vloads=True,
+                )
                 octet_body = []
 
-                # Iteration 0: head + compute.
-                emit_iter_head(octet_body)
+                # Iteration 0: vloads, idx-zeros, compute, and stores all in the DAG.
                 for bundle in schedule_bundles:
                     emit_bundle(
                         octet_body,
                         alu=bundle.get("alu"),
                         valu=bundle["valu"],
                         load=bundle["load"],
+                        store=bundle.get("store"),
                     )
 
-                # Turnaround: store iter0 and prefetch iter1 under stores.
-                idx_ops = [("^", g["idx"], g["idx"], g["idx"]) for g in active_groups]
-                idx_cursor = 0
-                for pi, gi in enumerate(pairs):
-                    load_ops = None
-                    if pi > 0:
-                        pgi = pairs[pi - 1]
-                        load_ops = [
-                            ("vload", active_groups[pgi]["val"], val_ptrs[pgi]),
-                            ("vload", active_groups[pgi + 1]["val"], val_ptrs[pgi + 1]),
-                        ]
-                    valu_ops = None
-                    if idx_cursor < len(idx_ops):
-                        valu_ops = idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]]
-                        idx_cursor += SLOT_LIMITS["valu"]
-                    emit_bundle(
-                        octet_body,
-                        alu=[
-                            ("+", val_ptrs[gi], val_ptrs[gi], ptr_step_const),
-                            ("+", val_ptrs[gi + 1], val_ptrs[gi + 1], ptr_step_const),
-                        ],
-                        valu=valu_ops,
-                        load=load_ops,
-                        store=[
-                            ("vstore", val_ptrs[gi], active_groups[gi]["val"]),
-                            ("vstore", val_ptrs[gi + 1], active_groups[gi + 1]["val"]),
-                        ],
-                    )
+                # Turnaround: only pointer updates needed (stores/vloads/idx-zeros
+                # are folded into the DAGs).
+                ptr_update_ops = [
+                    ("+", val_ptrs[gi], val_ptrs[gi], ptr_step_const)
+                    for gi in range(main_group_width)
+                ]
+                for i in range(0, len(ptr_update_ops), SLOT_LIMITS["alu"]):
+                    emit_bundle(octet_body, alu=ptr_update_ops[i : i + SLOT_LIMITS["alu"]])
 
-                last_gi = pairs[-1]
-                final_valu = None
-                if idx_cursor < len(idx_ops):
-                    final_valu = idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]]
-                    idx_cursor += SLOT_LIMITS["valu"]
-                emit_bundle(
-                    octet_body,
-                    valu=final_valu,
-                    load=[
-                        ("vload", active_groups[last_gi]["val"], val_ptrs[last_gi]),
-                        ("vload", active_groups[last_gi + 1]["val"], val_ptrs[last_gi + 1]),
-                    ],
-                )
-                while idx_cursor < len(idx_ops):
-                    emit_bundle(
-                        octet_body,
-                        valu=idx_ops[idx_cursor : idx_cursor + SLOT_LIMITS["valu"]],
-                    )
-                    idx_cursor += SLOT_LIMITS["valu"]
-
-                # Iteration 1: compute with final stores embedded in the DAG.
+                # Iteration 1: vloads, idx-zeros, compute, and stores all in the DAG.
                 for bundle in schedule_bundles_final:
                     emit_bundle(
                         octet_body,

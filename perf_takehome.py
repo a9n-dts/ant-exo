@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import os
 import random
 import unittest
 
@@ -211,6 +212,8 @@ class KernelBuilder:
         """
         assert batch_size % VLEN == 0, f"batch_size must be a multiple of VLEN={VLEN}"
         n_groups = batch_size // VLEN
+        max_pipeline_groups = int(os.environ.get("PK_PIPE_GROUPS", "16"))
+        max_pipeline_groups = max(8, min(max_pipeline_groups, n_groups))
 
         # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
@@ -382,6 +385,8 @@ class KernelBuilder:
         eight_vlen = 8 * VLEN
 
         val_ptrs = [tmp2, tmp4, tmp6, tmp8, tmp10, tmp12, tmp13, tmp14]
+        for i in range(max_pipeline_groups - 8):
+            val_ptrs.append(self.alloc_scratch(f"val_ptr_{i}"))
 
         groups_all = [
             {
@@ -449,9 +454,25 @@ class KernelBuilder:
                 "addr": v_addr_h,
             },
         ]
-        half_a = groups_all[:4]
-        half_b = groups_all[4:8]
+        for i in range(8, max_pipeline_groups):
+            groups_all.append(
+                {
+                    "idx": self.alloc_scratch(f"v_idx_{i}", VLEN),
+                    "val": self.alloc_scratch(f"v_val_{i}", VLEN),
+                    "node": self.alloc_scratch(f"v_node_val_{i}", VLEN),
+                    "tmp1": self.alloc_scratch(f"v_tmp1_{i}", VLEN),
+                    "tmp2": self.alloc_scratch(f"v_tmp2_{i}", VLEN),
+                    "addr": self.alloc_scratch(f"v_addr_{i}", VLEN),
+                }
+            )
         wrap_period = forest_height + 1
+        main_group_width = max_pipeline_groups
+        env_main_group_width = os.environ.get("PK_MAIN_GROUPS")
+        if env_main_group_width is not None:
+            main_group_width = int(env_main_group_width)
+        main_group_width = max(2, min(main_group_width, len(groups_all)))
+        if main_group_width % 2 != 0:
+            main_group_width -= 1
 
         def chunked(cycles, ops):
             for i in range(0, len(ops), SLOT_LIMITS["valu"]):
@@ -777,7 +798,7 @@ class KernelBuilder:
             for ops in schedule_valu_nodes(nodes):
                 emit_bundle(body, valu=ops)
 
-        def add_sched_node(nodes, engine, op, deps=None, decomposable=None):
+        def add_sched_node(nodes, engine, op, deps=None, decomposable=None, earliest=0):
             if decomposable is None:
                 decomposable = engine == "valu" and op[0] not in ("multiply_add", "vbroadcast")
             nodes.append(
@@ -787,6 +808,7 @@ class KernelBuilder:
                     "deps": [] if deps is None else deps,
                     "order": len(nodes),
                     "decomposable": decomposable,
+                    "earliest": earliest,
                 }
             )
             return len(nodes) - 1
@@ -794,6 +816,12 @@ class KernelBuilder:
         def schedule_mixed_nodes(nodes):
             if not nodes:
                 return []
+            alu_frag = int(os.environ.get("PK_ALU_FRAG", "4"))
+            if alu_frag <= 0:
+                alu_frag = 4
+            if VLEN % alu_frag != 0:
+                alu_frag = 4
+            alu_frag = min(alu_frag, SLOT_LIMITS["alu"])
 
             children = [[] for _ in nodes]
             for nid, node in enumerate(nodes):
@@ -808,6 +836,15 @@ class KernelBuilder:
             pending = set(range(len(nodes)))
             done_cycle = {}
             bundles = []
+            # Track remaining lane fragments for decomposable VALU ops.
+            # Splitting into smaller chunks helps pack ALU's 12 slots.
+            alu_lane_frags = {}
+            for nid, node in enumerate(nodes):
+                if node["engine"] == "valu" and node.get("decomposable"):
+                    frags = []
+                    for lane_lo in range(0, VLEN, alu_frag):
+                        frags.append((lane_lo, lane_lo + alu_frag))
+                    alu_lane_frags[nid] = frags
 
             while pending:
                 cycle_idx = len(bundles)
@@ -815,6 +852,8 @@ class KernelBuilder:
                 ready_load = []
                 for nid in pending:
                     node = nodes[nid]
+                    if node.get("earliest", 0) > cycle_idx:
+                        continue
                     if all(
                         dep in done_cycle and done_cycle[dep] < cycle_idx
                         for dep in node["deps"]
@@ -826,36 +865,120 @@ class KernelBuilder:
 
                 ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 ready_load.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
-                chosen_valu = ready_valu[: SLOT_LIMITS["valu"]]
 
-                # Spill 1 extra decomposable op to ALU engine (8 scalar ALU ops fit in 12 slots)
-                chosen_set = set(chosen_valu)
-                remaining = [nid for nid in ready_valu if nid not in chosen_set]
-                chosen_alu_vec = [
-                    nid for nid in remaining if nodes[nid].get("decomposable")
-                ][:1]
+                ready_valu_nondec = [
+                    nid for nid in ready_valu if not nodes[nid].get("decomposable")
+                ]
+                ready_valu_dec = [
+                    nid for nid in ready_valu if nodes[nid].get("decomposable")
+                ]
 
+                chosen_valu = ready_valu_nondec[: SLOT_LIMITS["valu"]]
                 chosen_load = ready_load[: SLOT_LIMITS["load"]]
+                chosen_alu_frags = []
+                chosen_alu_nodes = set()
 
-                if not chosen_valu and not chosen_load and not chosen_alu_vec:
+                alu_slots_left = SLOT_LIMITS["alu"]
+                while alu_slots_left >= alu_frag:
+                    candidates = [
+                        nid
+                        for nid in ready_valu_dec
+                        if nid not in chosen_valu and len(alu_lane_frags.get(nid, [])) > 0
+                    ]
+                    if not candidates:
+                        break
+                    # Finish partially-offloaded ops first to unblock dependents.
+                    candidates.sort(
+                        key=lambda nid: (
+                            0 if len(alu_lane_frags[nid]) == 1 else 1,
+                            -crit[nid],
+                            nodes[nid]["order"],
+                        )
+                    )
+                    nid = candidates[0]
+                    lane_lo, lane_hi = alu_lane_frags[nid].pop(0)
+                    frag_width = lane_hi - lane_lo
+                    if frag_width > alu_slots_left:
+                        alu_lane_frags[nid].insert(0, (lane_lo, lane_hi))
+                        break
+                    alu_slots_left -= frag_width
+                    chosen_alu_frags.append((nid, lane_lo, lane_hi))
+                    chosen_alu_nodes.add(nid)
+
+                valu_slots_left = SLOT_LIMITS["valu"] - len(chosen_valu)
+                if valu_slots_left > 0:
+                    for nid in ready_valu_dec:
+                        if nid in chosen_alu_nodes:
+                            continue
+                        chosen_valu.append(nid)
+                        if len(chosen_valu) >= SLOT_LIMITS["valu"]:
+                            break
+
+                if not chosen_valu and not chosen_load and not chosen_alu_frags:
                     raise RuntimeError("No schedulable ops in mixed scheduler")
+
+                alu_ops = []
+                for nid, lane_lo, lane_hi in chosen_alu_frags:
+                    op, dest, a1, a2 = nodes[nid]["op"]
+                    for lane in range(lane_lo, lane_hi):
+                        alu_ops.append((op, dest + lane, a1 + lane, a2 + lane))
 
                 bundles.append(
                     {
                         "valu": [nodes[nid]["op"] for nid in chosen_valu],
                         "load": [nodes[nid]["op"] for nid in chosen_load],
-                        "alu_vec": [nodes[nid]["op"] for nid in chosen_alu_vec],
+                        "alu": alu_ops,
                     }
                 )
-                for nid in chosen_valu + chosen_load + chosen_alu_vec:
+                completed_alu_nodes = [
+                    nid
+                    for nid in chosen_alu_nodes
+                    if len(alu_lane_frags.get(nid, [])) == 0
+                ]
+                for nid in chosen_valu + chosen_load + completed_alu_nodes:
                     pending.remove(nid)
                     done_cycle[nid] = cycle_idx
             return bundles
+
+        def add_mixed_hazard_deps(nodes):
+            """
+            Add RAW/WAW/WAR dependencies based on scratch addresses.
+            This makes scheduling robust when we aggressively remap decomposable
+            VALU ops to ALU without relying on hand-wired deps only.
+            """
+            last_writer = {}
+            last_readers = defaultdict(set)
+
+            for nid, node in enumerate(nodes):
+                reads, writes = self.get_slot_deps(node["engine"], node["op"])
+                deps = set(node["deps"])
+
+                for addr in reads:
+                    writer = last_writer.get(addr)
+                    if writer is not None:
+                        deps.add(writer)
+
+                for addr in writes:
+                    writer = last_writer.get(addr)
+                    if writer is not None:
+                        deps.add(writer)
+                    deps.update(last_readers[addr])
+
+                node["deps"] = list(deps)
+
+                for addr in reads:
+                    last_readers[addr].add(nid)
+
+                for addr in writes:
+                    last_writer[addr] = nid
+                    last_readers[addr].clear()
 
         def build_octet_schedule(groups):
             nodes = []
             val_ready = [None] * len(groups)
             idx_ready = [None] * len(groups)
+            skew_gap = int(os.environ.get("PK_SKEW_GAP", "0"))
+            skew_period = max(1, int(os.environ.get("PK_SKEW_PERIOD", "4")))
 
             def deps_of(*deps):
                 return [dep for dep in deps if dep is not None]
@@ -863,12 +986,16 @@ class KernelBuilder:
             for round_idx in range(rounds):
                 mode = gather_mode(round_idx)
                 for gi, g in enumerate(groups):
+                    start_earliest = 0
+                    if round_idx == 0 and skew_gap > 0:
+                        start_earliest = (gi % skew_period) * skew_gap
                     if mode == "root":
                         val_ready[gi] = add_sched_node(
                             nodes,
                             "valu",
                             ("^", g["val"], g["val"], v_root),
                             deps=deps_of(val_ready[gi]),
+                            earliest=start_earliest,
                         )
                     elif mode == "d1":
                         n1 = add_sched_node(
@@ -876,6 +1003,7 @@ class KernelBuilder:
                             "valu",
                             ("&", g["tmp1"], g["idx"], v_one),
                             deps=deps_of(idx_ready[gi]),
+                            earliest=start_earliest,
                         )
                         n2 = add_sched_node(
                             nodes,
@@ -895,6 +1023,7 @@ class KernelBuilder:
                             "valu",
                             ("-", g["tmp1"], g["idx"], v_d2_offset),
                             deps=deps_of(idx_ready[gi]),
+                            earliest=start_earliest,
                         )
                         n2 = add_sched_node(
                             nodes,
@@ -944,6 +1073,7 @@ class KernelBuilder:
                             "valu",
                             ("+", g["addr"], v_fvp, g["idx"]),
                             deps=deps_of(idx_ready[gi]),
+                            earliest=start_earliest,
                         )
                         load_nodes = []
                         for offset in range(VLEN):
@@ -1030,6 +1160,7 @@ class KernelBuilder:
                                 deps=[n1, n2],
                             )
 
+            add_mixed_hazard_deps(nodes)
             return schedule_mixed_nodes(nodes)
 
         def emit_tail_groups(group_count, g_off_words):
@@ -1068,9 +1199,10 @@ class KernelBuilder:
 
         # Octet loop scheduled from a single dependency graph across all
         # 8 groups so load-heavy gathers and hash chains can interleave freely.
-        octet_groups = (n_groups // 8) * 8
+        octet_groups = (n_groups // main_group_width) * main_group_width
         if octet_groups > 0:
             self.add("load", ("const", loop_g_off, 0))
+            active_groups = groups_all[:main_group_width]
             octet_batch = octet_groups * VLEN
             loop_bound = (
                 batch_size_const
@@ -1086,7 +1218,7 @@ class KernelBuilder:
                     ("+", val_ptrs[0], inp_values_p, loop_g_off),
                 ],
             )
-            for gi in range(1, 8):
+            for gi in range(1, main_group_width):
                 emit_bundle(
                     octet_body,
                     alu=[
@@ -1097,42 +1229,37 @@ class KernelBuilder:
             # Assumes all initial indices are 0.
             emit_valu_chunked(
                 octet_body,
-                [("^", g["idx"], g["idx"], g["idx"]) for g in groups_all],
+                [("^", g["idx"], g["idx"], g["idx"]) for g in active_groups],
             )
 
-            for gi in range(0, 8, 2):
+            for gi in range(0, main_group_width, 2):
                 emit_bundle(
                     octet_body,
                     load=[
-                        ("vload", groups_all[gi]["val"], val_ptrs[gi]),
-                        ("vload", groups_all[gi + 1]["val"], val_ptrs[gi + 1]),
+                        ("vload", active_groups[gi]["val"], val_ptrs[gi]),
+                        ("vload", active_groups[gi + 1]["val"], val_ptrs[gi + 1]),
                     ],
                 )
 
-            for bundle in build_octet_schedule(groups_all):
-                alu_ops = []
-                for op_tuple in bundle.get("alu_vec", []):
-                    op, dest, a1, a2 = op_tuple
-                    for i in range(VLEN):
-                        alu_ops.append((op, dest + i, a1 + i, a2 + i))
+            for bundle in build_octet_schedule(active_groups):
                 emit_bundle(
                     octet_body,
-                    alu=alu_ops or None,
+                    alu=bundle.get("alu"),
                     valu=bundle["valu"],
                     load=bundle["load"],
                 )
 
-            for gi in range(0, 8, 2):
+            for gi in range(0, main_group_width, 2):
                 flow_ops = (
-                    [("add_imm", loop_g_off, loop_g_off, eight_vlen)]
-                    if gi == 6
+                    [("add_imm", loop_g_off, loop_g_off, main_group_width * VLEN)]
+                    if gi == main_group_width - 2
                     else None
                 )
                 emit_bundle(
                     octet_body,
                     store=[
-                        ("vstore", val_ptrs[gi], groups_all[gi]["val"]),
-                        ("vstore", val_ptrs[gi + 1], groups_all[gi + 1]["val"]),
+                        ("vstore", val_ptrs[gi], active_groups[gi]["val"]),
+                        ("vstore", val_ptrs[gi + 1], active_groups[gi + 1]["val"]),
                     ],
                     flow=flow_ops,
                 )
@@ -1146,12 +1273,12 @@ class KernelBuilder:
         remaining_groups = n_groups - processed_groups
         tail_g_off = processed_groups * VLEN
 
-        if remaining_groups >= 3:
+        while remaining_groups >= 3:
             emit_tail_groups(3, tail_g_off)
             tail_g_off += three_vlen
             remaining_groups -= 3
 
-        if remaining_groups >= 2:
+        while remaining_groups >= 2:
             emit_tail_groups(2, tail_g_off)
             tail_g_off += two_vlen
             remaining_groups -= 2

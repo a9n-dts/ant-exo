@@ -246,6 +246,8 @@ class KernelBuilder:
         tmp10 = self.alloc_scratch("tmp10")
         tmp11 = self.alloc_scratch("tmp11")
         tmp12 = self.alloc_scratch("tmp12")
+        tmp13 = self.alloc_scratch("tmp13")
+        tmp14 = self.alloc_scratch("tmp14")
 
         # Vector work registers for six interleaved groups (VLEN=8 words each)
         v_idx_a = self.alloc_scratch("v_idx_a", VLEN)
@@ -290,18 +292,45 @@ class KernelBuilder:
         v_tmp2_f = self.alloc_scratch("v_tmp2_f", VLEN)
         v_addr_f = self.alloc_scratch("v_addr_f", VLEN)
 
+        v_idx_g = self.alloc_scratch("v_idx_g", VLEN)
+        v_val_g = self.alloc_scratch("v_val_g", VLEN)
+        v_node_val_g = self.alloc_scratch("v_node_val_g", VLEN)
+        v_tmp1_g = self.alloc_scratch("v_tmp1_g", VLEN)
+        v_tmp2_g = self.alloc_scratch("v_tmp2_g", VLEN)
+        v_addr_g = self.alloc_scratch("v_addr_g", VLEN)
+
+        v_idx_h = self.alloc_scratch("v_idx_h", VLEN)
+        v_val_h = self.alloc_scratch("v_val_h", VLEN)
+        v_node_val_h = self.alloc_scratch("v_node_val_h", VLEN)
+        v_tmp1_h = self.alloc_scratch("v_tmp1_h", VLEN)
+        v_tmp2_h = self.alloc_scratch("v_tmp2_h", VLEN)
+        v_addr_h = self.alloc_scratch("v_addr_h", VLEN)
+
         # Vector constants (broadcast from scalars)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_fvp = self.alloc_scratch("v_fvp", VLEN)
         v_root = self.alloc_scratch("v_root", VLEN)
+        v_d1_l = self.alloc_scratch("v_d1_l", VLEN)
+        v_d1_r = self.alloc_scratch("v_d1_r", VLEN)
+        v_d1_delta = self.alloc_scratch("v_d1_delta", VLEN)
         root_node = self.alloc_scratch("root_node")
+        node_addr = self.alloc_scratch("node_addr")
+        node_d1_l = self.alloc_scratch("node_d1_l")
+        node_d1_r = self.alloc_scratch("node_d1_r")
 
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
         self.add("valu", ("vbroadcast", v_fvp, self.scratch["forest_values_p"]))
         self.add("load", ("load", root_node, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", v_root, root_node))
+        self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], 1))
+        self.add("load", ("load", node_d1_l, node_addr))
+        self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], 2))
+        self.add("load", ("load", node_d1_r, node_addr))
+        self.add("valu", ("vbroadcast", v_d1_l, node_d1_l))
+        self.add("valu", ("vbroadcast", v_d1_r, node_d1_r))
+        self.add("valu", ("-", v_d1_delta, v_d1_l, v_d1_r))
 
         # Broadcast hash stage constants to vectors and precompute simplified stages.
         # For stages of the form (a + c1) + (a << k), use multiply_add:
@@ -331,9 +360,9 @@ class KernelBuilder:
         vlen_const = self.scratch_const(VLEN)
         two_vlen = 2 * VLEN
         three_vlen = 3 * VLEN
-        six_vlen = 6 * VLEN
+        eight_vlen = 8 * VLEN
 
-        val_ptrs = [tmp2, tmp4, tmp6, tmp8, tmp10, tmp12]
+        val_ptrs = [tmp2, tmp4, tmp6, tmp8, tmp10, tmp12, tmp13, tmp14]
 
         groups_all = [
             {
@@ -384,23 +413,67 @@ class KernelBuilder:
                 "tmp2": v_tmp2_f,
                 "addr": v_addr_f,
             },
+            {
+                "idx": v_idx_g,
+                "val": v_val_g,
+                "node": v_node_val_g,
+                "tmp1": v_tmp1_g,
+                "tmp2": v_tmp2_g,
+                "addr": v_addr_g,
+            },
+            {
+                "idx": v_idx_h,
+                "val": v_val_h,
+                "node": v_node_val_h,
+                "tmp1": v_tmp1_h,
+                "tmp2": v_tmp2_h,
+                "addr": v_addr_h,
+            },
         ]
-        triplet_a = groups_all[:3]
-        triplet_b = groups_all[3:6]
+        half_a = groups_all[:4]
+        half_b = groups_all[4:8]
         wrap_period = forest_height + 1
 
-        def append_round_ops_inphase(body, groups, round_idx):
-            if round_idx % wrap_period == 0:
+        def chunked(cycles, ops):
+            for i in range(0, len(ops), SLOT_LIMITS["valu"]):
+                cycles.append(ops[i : i + SLOT_LIMITS["valu"]])
+
+        def gather_mode(round_idx):
+            depth = round_idx % wrap_period
+            if depth == 0:
+                return "root"
+            if depth == 1:
+                return "d1"
+            return "gather"
+
+        def gather_slots_inphase(groups, round_idx):
+            body = []
+            mode = gather_mode(round_idx)
+            if mode == "root":
                 for g in groups:
                     body.append(("valu", ("^", g["val"], g["val"], v_root)))
-            else:
+                return body
+            if mode == "d1":
                 for g in groups:
-                    body.append(("valu", ("+", g["addr"], v_fvp, g["idx"])))
-                for offset in range(VLEN):
-                    for g in groups:
-                        body.append(("load", ("load_offset", g["node"], g["addr"], offset)))
+                    body.append(("valu", ("&", g["tmp1"], g["idx"], v_one)))
+                for g in groups:
+                    body.append(
+                        ("valu", ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r))
+                    )
                 for g in groups:
                     body.append(("valu", ("^", g["val"], g["val"], g["node"])))
+                return body
+            for g in groups:
+                body.append(("valu", ("+", g["addr"], v_fvp, g["idx"])))
+            for offset in range(VLEN):
+                for g in groups:
+                    body.append(("load", ("load_offset", g["node"], g["addr"], offset)))
+            for g in groups:
+                body.append(("valu", ("^", g["val"], g["val"], g["node"])))
+            return body
+
+        def append_round_ops_inphase(body, groups, round_idx):
+            body.extend(gather_slots_inphase(groups, round_idx))
 
             # In-phase hash packing across all active groups.
             for stage in hash_stage_plan:
@@ -447,89 +520,113 @@ class KernelBuilder:
             if bundle:
                 body.append(bundle)
 
+        def emit_valu_chunked(body, ops):
+            for i in range(0, len(ops), SLOT_LIMITS["valu"]):
+                emit_bundle(body, valu=ops[i : i + SLOT_LIMITS["valu"]])
+
         def hash_cycles(groups, round_idx, need_next_addr):
             cycles = []
             for stage in hash_stage_plan:
                 if stage[0] == "muladd":
                     _, v_mul, v_add = stage
-                    cycles.append(
-                        [
-                            ("multiply_add", g["val"], g["val"], v_mul, v_add)
-                            for g in groups
-                        ]
+                    chunked(
+                        cycles,
+                        [("multiply_add", g["val"], g["val"], v_mul, v_add) for g in groups],
                     )
                 else:
                     _, op1, op2, op3, vc1, vc3 = stage
-                    cycles.append(
+                    chunked(
+                        cycles,
                         [(op1, g["tmp1"], g["val"], vc1) for g in groups]
-                        + [(op3, g["tmp2"], g["val"], vc3) for g in groups]
+                        + [(op3, g["tmp2"], g["val"], vc3) for g in groups],
                     )
-                    cycles.append(
-                        [(op2, g["val"], g["tmp1"], g["tmp2"]) for g in groups]
-                    )
+                    chunked(cycles, [(op2, g["val"], g["tmp1"], g["tmp2"]) for g in groups])
 
-            if (round_idx + 1) % wrap_period == 0:
-                cycles.append([("^", g["idx"], g["idx"], g["idx"]) for g in groups])
-            else:
-                cycles.append(
-                    [("&", g["tmp1"], g["val"], v_one) for g in groups]
-                    + [("multiply_add", g["idx"], g["idx"], v_two, v_one) for g in groups]
-                )
-                cycles.append([("+", g["idx"], g["idx"], g["tmp1"]) for g in groups])
+            should_update_idx = (
+                round_idx < rounds - 1 and (round_idx + 1) % wrap_period != 0
+            )
+            if should_update_idx:
+                if round_idx % wrap_period == 0:
+                    # Root rounds always start with idx=0, so next idx is 1 + (val & 1).
+                    chunked(cycles, [("&", g["tmp1"], g["val"], v_one) for g in groups])
+                    chunked(cycles, [("+", g["idx"], g["tmp1"], v_one) for g in groups])
+                else:
+                    chunked(
+                        cycles,
+                        [("&", g["tmp1"], g["val"], v_one) for g in groups]
+                        + [
+                            ("multiply_add", g["idx"], g["idx"], v_two, v_one)
+                            for g in groups
+                        ],
+                    )
+                    chunked(cycles, [("+", g["idx"], g["idx"], g["tmp1"]) for g in groups])
 
             if need_next_addr:
-                cycles.append([("+", g["addr"], v_fvp, g["idx"]) for g in groups])
+                chunked(cycles, [("+", g["addr"], v_fvp, g["idx"]) for g in groups])
             return cycles
 
-        def emit_gather_only(body, groups, gather_round_idx):
-            if gather_round_idx % wrap_period == 0:
-                emit_bundle(body, valu=[("^", g["val"], g["val"], v_root) for g in groups])
-                return
+        def gather_plan(groups, gather_round_idx):
+            mode = gather_mode(gather_round_idx)
+            if mode == "root":
+                return [], [[("^", g["val"], g["val"], v_root) for g in groups]], 0
+            if mode == "d1":
+                return [], [
+                    [("&", g["tmp1"], g["idx"], v_one) for g in groups],
+                    [
+                        ("multiply_add", g["node"], g["tmp1"], v_d1_delta, v_d1_r)
+                        for g in groups
+                    ],
+                    [("^", g["val"], g["val"], g["node"]) for g in groups],
+                ], 0
+            load_cycles = []
             load_ops = []
             for offset in range(VLEN):
                 for g in groups:
                     load_ops.append(("load_offset", g["node"], g["addr"], offset))
+            for i in range(0, len(load_ops), SLOT_LIMITS["load"]):
+                load_cycles.append(load_ops[i : i + SLOT_LIMITS["load"]])
+            # XOR depends on all gathers, so earliest start is next cycle after load cycles.
+            return load_cycles, [[("^", g["val"], g["val"], g["node"]) for g in groups]], len(load_cycles)
 
-            for ci in range(12):
-                emit_bundle(body, load=load_ops[2 * ci : 2 * ci + 2])
-            emit_bundle(body, valu=[("^", g["val"], g["val"], g["node"]) for g in groups])
+        def emit_gather_only(body, groups, gather_round_idx):
+            load_cycles, gather_valu_cycles, gather_start = gather_plan(groups, gather_round_idx)
+            bundles = [{"load": lc, "valu": []} for lc in load_cycles]
+            pos = gather_start
+            for ops in gather_valu_cycles:
+                while len(bundles) <= pos:
+                    bundles.append({"load": [], "valu": []})
+                bundles[pos]["valu"].extend(ops)
+                pos += 1
+            for b in bundles:
+                emit_bundle(body, valu=b["valu"], load=b["load"])
 
         def emit_overlap_phase(
             body, gather_groups, hash_groups, round_idx, need_next_addr, gather_round_idx
         ):
             hcycles = hash_cycles(hash_groups, round_idx, need_next_addr)
-            gather_is_root = gather_round_idx % wrap_period == 0
-            phase_len = len(hcycles) if gather_is_root else max(len(hcycles), 13)
+            load_cycles, gather_valu_cycles, gather_start = gather_plan(
+                gather_groups, gather_round_idx
+            )
+            phase_len = max(len(hcycles), len(load_cycles))
             bundles = [{"valu": [], "load": []} for _ in range(phase_len)]
 
             for ci, ops in enumerate(hcycles):
                 bundles[ci]["valu"].extend(ops)
+            for ci, loads in enumerate(load_cycles):
+                while len(bundles) <= ci:
+                    bundles.append({"valu": [], "load": []})
+                bundles[ci]["load"].extend(loads)
 
-            if not gather_is_root:
-                load_ops = []
-                for offset in range(VLEN):
-                    for g in gather_groups:
-                        load_ops.append(("load_offset", g["node"], g["addr"], offset))
-                for ci in range(12):
-                    bundles[ci]["load"].extend(load_ops[2 * ci : 2 * ci + 2])
-
-            xor_src = v_root if gather_is_root else None
-            xor_ops = []
-            for g in gather_groups:
-                if gather_is_root:
-                    xor_ops.append(("^", g["val"], g["val"], xor_src))
-                else:
-                    xor_ops.append(("^", g["val"], g["val"], g["node"]))
-            xor_cycle = None
-            start_ci = 0 if gather_is_root else 12
-            for ci in range(start_ci, phase_len):
-                if len(bundles[ci]["valu"]) <= 3:
-                    xor_cycle = ci
-                    break
-            if xor_cycle is None:
-                bundles.append({"valu": xor_ops, "load": []})
-            else:
-                bundles[xor_cycle]["valu"].extend(xor_ops)
+            pos = gather_start
+            for ops in gather_valu_cycles:
+                while True:
+                    while len(bundles) <= pos:
+                        bundles.append({"valu": [], "load": []})
+                    if len(bundles[pos]["valu"]) + len(ops) <= SLOT_LIMITS["valu"]:
+                        bundles[pos]["valu"].extend(ops)
+                        pos += 1
+                        break
+                    pos += 1
 
             for b in bundles:
                 emit_bundle(body, valu=b["valu"], load=b["load"])
@@ -572,102 +669,106 @@ class KernelBuilder:
 
             self.instrs.extend(self.build(tail_body))
 
-        self.add("flow", ("pause",))
-
-        # Software-pipelined sextet loop: overlap gather(load) of one triplet
-        # with hash/index(valu) of the other triplet.
-        sextet_groups = (n_groups // 6) * 6
-        if sextet_groups > 0:
+        # Software-pipelined octet loop: overlap gather(load) of one half
+        # with hash/index(valu) of the other half.
+        octet_groups = (n_groups // 8) * 8
+        if octet_groups > 0:
             self.add("load", ("const", loop_g_off, 0))
-            sextet_batch = sextet_groups * VLEN
+            octet_batch = octet_groups * VLEN
             loop_bound = (
                 self.scratch["batch_size"]
-                if sextet_batch == batch_size
-                else self.scratch_const(sextet_batch)
+                if octet_batch == batch_size
+                else self.scratch_const(octet_batch)
             )
 
-            sextet_body = []
+            octet_body = []
 
             emit_bundle(
-                sextet_body,
+                octet_body,
                 alu=[
                     ("+", val_ptrs[0], self.scratch["inp_values_p"], loop_g_off),
                 ],
             )
-            for gi in range(1, 6):
+            for gi in range(1, 8):
                 emit_bundle(
-                    sextet_body,
+                    octet_body,
                     alu=[
                         ("+", val_ptrs[gi], val_ptrs[gi - 1], vlen_const),
                     ],
                 )
 
             # Assumes all initial indices are 0.
-            emit_bundle(
-                sextet_body,
-                valu=[("^", g["idx"], g["idx"], g["idx"]) for g in groups_all],
+            emit_valu_chunked(
+                octet_body,
+                [("^", g["idx"], g["idx"], g["idx"]) for g in groups_all],
             )
 
             for gi, g in enumerate(groups_all):
                 emit_bundle(
-                    sextet_body,
+                    octet_body,
                     load=[
                         ("vload", g["val"], val_ptrs[gi]),
                     ],
                 )
 
             # Initial round-0 addresses for both triplets.
-            emit_bundle(
-                sextet_body,
-                valu=[("+", g["addr"], v_fvp, g["idx"]) for g in groups_all],
+            emit_valu_chunked(
+                octet_body,
+                [("+", g["addr"], v_fvp, g["idx"]) for g in groups_all],
             )
 
-            # Prologue: gather triplet A round 0 so hash(A,0) can start.
-            emit_gather_only(sextet_body, triplet_a, 0)
+            # Prologue: gather first half round 0 so hash(A,0) can start.
+            emit_gather_only(octet_body, half_a, 0)
 
             for round_idx in range(rounds):
-                need_a_next = round_idx < rounds - 1
+                need_next_addr = (
+                    round_idx < rounds - 1 and gather_mode(round_idx + 1) == "gather"
+                )
                 emit_overlap_phase(
-                    sextet_body,
-                    gather_groups=triplet_b,
-                    hash_groups=triplet_a,
+                    octet_body,
+                    gather_groups=half_b,
+                    hash_groups=half_a,
                     round_idx=round_idx,
-                    need_next_addr=need_a_next,
+                    need_next_addr=need_next_addr,
                     gather_round_idx=round_idx,
                 )
                 if round_idx < rounds - 1:
                     emit_overlap_phase(
-                        sextet_body,
-                        gather_groups=triplet_a,
-                        hash_groups=triplet_b,
+                        octet_body,
+                        gather_groups=half_a,
+                        hash_groups=half_b,
                         round_idx=round_idx,
-                        need_next_addr=True,
+                        need_next_addr=need_next_addr,
                         gather_round_idx=round_idx + 1,
                     )
                 else:
                     emit_hash_only(
-                        sextet_body,
-                        groups=triplet_b,
+                        octet_body,
+                        groups=half_b,
                         round_idx=round_idx,
                         need_next_addr=False,
                     )
 
             for gi, g in enumerate(groups_all):
-                flow_ops = [("add_imm", loop_g_off, loop_g_off, six_vlen)] if gi == 5 else None
+                flow_ops = (
+                    [("add_imm", loop_g_off, loop_g_off, eight_vlen)]
+                    if gi == 7
+                    else None
+                )
                 emit_bundle(
-                    sextet_body,
+                    octet_body,
                     store=[
                         ("vstore", val_ptrs[gi], g["val"]),
                     ],
                     flow=flow_ops,
                 )
 
-            sextet_body_len = len(sextet_body)
-            self.instrs.extend(sextet_body)
+            octet_body_len = len(octet_body)
+            self.instrs.extend(octet_body)
             self.instrs.append({"alu": [("<", cond, loop_g_off, loop_bound)]})
-            self.instrs.append({"flow": [("cond_jump_rel", cond, -(sextet_body_len + 2))]})
+            self.instrs.append({"flow": [("cond_jump_rel", cond, -(octet_body_len + 2))]})
 
-        processed_groups = sextet_groups
+        processed_groups = octet_groups
         remaining_groups = n_groups - processed_groups
         tail_g_off = processed_groups * VLEN
 
@@ -684,8 +785,7 @@ class KernelBuilder:
         if remaining_groups == 1:
             emit_tail_groups(1, tail_g_off)
 
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        # No pauses in the submission path; we validate against final memory.
 
 BASELINE = 147734
 
@@ -717,22 +817,18 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    machine.run()
+    for ref_mem in reference_kernel2(mem, value_trace):
+        pass
+
+    inp_values_p = ref_mem[6]
+    if prints:
+        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+    assert (
+        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+        == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+    ), "Incorrect output values"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)

@@ -1036,8 +1036,30 @@ class KernelBuilder:
                             ready_load.append(nid)
 
                 ready_valu.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
-                ready_load.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
                 ready_store.sort(key=lambda nid: (-crit[nid], nodes[nid]["order"]))
+                # For gather-heavy phases, finishing all 8 lane loads for one
+                # destination vector tends to unblock VALU earlier than spraying
+                # loads across many groups.
+                prev_load_dest = None
+                if bundles:
+                    prev_loads = bundles[-1]["load"]
+                    if prev_loads:
+                        op = prev_loads[0]
+                        if op[0] == "load_offset":
+                            prev_load_dest = op[1]
+                ready_load.sort(
+                    key=lambda nid: (
+                        0
+                        if (
+                            prev_load_dest is not None
+                            and nodes[nid]["op"][0] == "load_offset"
+                            and nodes[nid]["op"][1] == prev_load_dest
+                        )
+                        else 1,
+                        -crit[nid],
+                        nodes[nid]["order"],
+                    )
+                )
 
                 ready_valu_nondec = [
                     nid for nid in ready_valu if not nodes[nid].get("decomposable")
@@ -1051,6 +1073,22 @@ class KernelBuilder:
                 chosen_store = ready_store[: SLOT_LIMITS["store"]]
                 chosen_alu_frags = []
                 chosen_alu_nodes = set()
+
+                # Fill spare VALU slots with decomposable ops that have NOT yet
+                # started ALU decomposition.  This shifts throughput from the
+                # saturated ALU engine to the underused VALU engine.
+                n_frags_full = VLEN // alu_frag
+                valu_slots_left = SLOT_LIMITS["valu"] - len(chosen_valu)
+                chosen_valu_dec = set()
+                if valu_slots_left > 0:
+                    for nid in ready_valu_dec:
+                        frags = alu_lane_frags.get(nid)
+                        if frags is not None and len(frags) == n_frags_full:
+                            # Not yet started on ALU — safe to claim for VALU
+                            chosen_valu.append(nid)
+                            chosen_valu_dec.add(nid)
+                            if len(chosen_valu) >= SLOT_LIMITS["valu"]:
+                                break
 
                 alu_slots_left = SLOT_LIMITS["alu"]
                 decomposed_ops_this_cycle = 0
@@ -1087,7 +1125,7 @@ class KernelBuilder:
                 valu_slots_left = SLOT_LIMITS["valu"] - len(chosen_valu)
                 if valu_slots_left > 0:
                     for nid in ready_valu_dec:
-                        if nid in chosen_alu_nodes:
+                        if nid in chosen_alu_nodes or nid in chosen_valu_dec:
                             continue
                         chosen_valu.append(nid)
                         if len(chosen_valu) >= SLOT_LIMITS["valu"]:
@@ -1695,7 +1733,8 @@ class KernelBuilder:
         if remaining_groups == 1:
             emit_tail_groups(1, tail_g_off)
 
-        # Repack any serialized one-slot runs into VLIW bundles without reordering.
+        # Repack serialized single-engine runs into VLIW bundles without
+        # reordering, reducing avoidable underfill in setup/turnaround sections.
         repacked = []
         run_slots = []
 
@@ -1708,9 +1747,9 @@ class KernelBuilder:
         for instr in self.instrs:
             if len(instr) == 1:
                 engine, ops = next(iter(instr.items()))
-                if len(ops) == 1:
-                    run_slots.append((engine, ops[0]))
-                    continue
+                for op in ops:
+                    run_slots.append((engine, op))
+                continue
             flush_run()
             repacked.append(instr)
         flush_run()
